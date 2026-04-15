@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="{{ locale }}">
+<head>
+<meta charset="utf-8" />
+<title data-i18n="brand.name">Bossify with Claude</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="/static/app.css" />
+<script src="/static/echarts.min.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <div class="logo">◆</div>
+    <div>
+      <div class="brand-name" data-i18n="brand.name">Bossify with Claude</div>
+      <div class="brand-sub">
+        <span data-i18n="brand.sub">local-first flight recorder + ROI analyzer</span>
+        ·
+        <span data-i18n="brand.data_dir_label">data dir:</span>
+        <code>{{ data_dir }}</code>
+      </div>
+    </div>
+  </div>
+  <div class="topbar-meta">
+    <span id="locale-switch" class="locale-switch">
+      <a href="?locale=en" data-locale="en">EN</a>
+      <span class="sep">·</span>
+      <a href="?locale=zh" data-locale="zh">中文</a>
+    </span>
+    <span id="last-updated">—</span>
+  </div>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button class="tab active" data-tab="team"      data-i18n="tab.team">Team Overview</button>
+  <button class="tab"        data-tab="employees" data-i18n="tab.employees">Employees</button>
+  <button class="tab"        data-tab="advanced"  data-i18n="tab.advanced">Advanced</button>
+</nav>
+
+<!-- ============================================================ -->
+<!-- TEAM OVERVIEW                                                -->
+<!-- ============================================================ -->
+<main id="view-team" class="view active">
+  <section class="kpis team-kpis">
+    <div class="kpi">
+      <div class="kpi-label" data-i18n="team.active_employees">active employees</div>
+      <div class="kpi-value" id="team-kpi-employees">—</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label" data-i18n="team.total_spend">team token spend</div>
+      <div class="kpi-value" id="team-kpi-cost">—</div>
+      <div class="kpi-sub" data-i18n="team.total_spend_sub">effective cost</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label" data-i18n="team.avg_efficiency">avg efficiency</div>
+      <div class="kpi-value" id="team-kpi-eff">—</div>
+      <div class="kpi-sub" data-i18n="team.avg_efficiency_sub">LLM-judged, 0 to 1</div>
+    </div>
+    <div class="kpi roi-high">
+      <div class="kpi-label" data-i18n="team.high_value_sessions">high-value sessions</div>
+      <div class="kpi-value" id="team-kpi-high">—</div>
+      <div class="kpi-sub" data-i18n="team.high_value_sessions_sub">LLM ≥ 0.85</div>
+    </div>
+    <div class="kpi roi-wasted">
+      <div class="kpi-label" data-i18n="team.waste_alerts">waste alerts</div>
+      <div class="kpi-value" id="team-kpi-waste">—</div>
+      <div class="kpi-sub" data-i18n="team.waste_alerts_sub">LOW_VALUE + WASTED</div>
+    </div>
+  </section>
+
+  <section class="grid">
+    <div class="card span-5">
+      <div class="card-head" data-i18n="team.roi_distribution">team ROI distribution</div>
+      <div class="chart" id="chart-team-roi"></div>
+    </div>
+    <div class="card span-7">
+      <div class="card-head" data-i18n="team.top_waste_patterns">top waste patterns</div>
+      <div class="team-waste" id="team-waste-list"></div>
+    </div>
+    <div class="card span-12">
+      <div class="card-head">
+        <span data-i18n="team.leaderboard">waste leaderboard</span>
+        <span class="hint" data-i18n="card.hint_click">click to inspect</span>
+      </div>
+      <div class="strip" id="team-leaderboard"></div>
+    </div>
+  </section>
+</main>
+
+<!-- ============================================================ -->
+<!-- EMPLOYEES                                                    -->
+<!-- ============================================================ -->
+<main id="view-employees" class="view">
+  <section class="employees-grid" id="employees-grid">
+    <div class="loading" data-i18n="common.loading">Loading</div>
+  </section>
+</main>
+
+<!-- ============================================================ -->
+<!-- ADVANCED (existing technical dashboard)                      -->
+<!-- ============================================================ -->
+<main id="view-advanced" class="view">
+  <section class="kpis">
+    <div class="kpi">
+      <div class="kpi-label" data-i18n="kpi.total_flow">total flow</div>
+      <div class="kpi-value" id="kpi-total">—</div>
+      <div class="kpi-sub" id="kpi-total-sub" data-i18n="kpi.total_flow_sub">tokens across all events</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label" data-i18n="kpi.sessions">sessions</div>
+      <div class="kpi-value" id="kpi-sessions">—</div>
+      <div class="kpi-sub" id="kpi-events-sub">—</div>
+    </div>
+    <div class="kpi roi-high">
+      <div class="kpi-label" data-i18n="kpi.high_value">high value</div>
+      <div class="kpi-value" id="kpi-high">—</div>
+      <div class="kpi-sub" data-i18n="kpi.high_value_sub">durable + reused</div>
+    </div>
+    <div class="kpi roi-transient">
+      <div class="kpi-label" data-i18n="kpi.transient">transient</div>
+      <div class="kpi-value" id="kpi-transient">—</div>
+      <div class="kpi-sub" data-i18n="kpi.transient_sub">output without reuse</div>
+    </div>
+    <div class="kpi roi-low">
+      <div class="kpi-label" data-i18n="kpi.low_value">low value</div>
+      <div class="kpi-value" id="kpi-low">—</div>
+      <div class="kpi-sub" data-i18n="kpi.low_value_sub">poor value per token</div>
+    </div>
+    <div class="kpi roi-wasted">
+      <div class="kpi-label" data-i18n="kpi.wasted">wasted</div>
+      <div class="kpi-value" id="kpi-wasted">—</div>
+      <div class="kpi-sub" data-i18n="kpi.wasted_sub">zero durable return</div>
+    </div>
+  </section>
+
+  <section class="grid">
+    <div class="card span-4">
+      <div class="card-head" data-i18n="card.roi_distribution">ROI distribution</div>
+      <div class="chart" id="chart-roi"></div>
+    </div>
+
+    <div class="card span-8">
+      <div class="card-head">
+        <span data-i18n="card.cost_breakdown">Per-session token breakdown</span>
+        <span class="hint" data-i18n="card.hint_click_bar">click a bar to inspect</span>
+      </div>
+      <div class="chart" id="chart-cost"></div>
+    </div>
+
+    <div class="card span-12">
+      <div class="card-head">
+        <span data-i18n="card.top_spenders">Top token spenders</span>
+        <span class="hint" data-i18n="card.hint_click_bar_session">click a bar to inspect its session</span>
+      </div>
+      <div class="chart tall" id="chart-top-spenders"></div>
+    </div>
+
+    <div class="card span-7">
+      <div class="card-head" data-i18n="card.timeline">Token flow over time (30-min buckets)</div>
+      <div class="chart" id="chart-timeline"></div>
+    </div>
+
+    <div class="card span-5">
+      <div class="card-head" data-i18n="card.memory_scatter">Memory effectiveness</div>
+      <div class="chart" id="chart-memory-scatter"></div>
+    </div>
+
+    <div class="card span-6">
+      <div class="card-head" data-i18n="card.tools">Tool usage</div>
+      <div class="chart" id="chart-tools"></div>
+    </div>
+
+    <div class="card span-6">
+      <div class="card-head">
+        <span data-i18n="card.black_holes">Token black holes</span>
+        <span class="hint" data-i18n="card.hint_click">click to inspect</span>
+      </div>
+      <div class="chart" id="chart-black-holes"></div>
+    </div>
+
+    <div class="card span-12">
+      <div class="card-head">
+        <span data-i18n="card.llm_verdicts">Local-LLM verdicts</span>
+        <span class="card-sub" id="llm-model">—</span>
+      </div>
+      <div id="llm-list" class="llm-list"></div>
+    </div>
+
+    <div class="card span-12">
+      <div class="card-head">
+        <span data-i18n="card.query">Hybrid query</span>
+        <form id="query-form" class="inline-form">
+          <input name="q" type="text" autocomplete="off"
+                 data-i18n-placeholder="form.query_placeholder"
+                 placeholder="auth middleware rewrite" />
+          <button type="submit" data-i18n="form.query_button">query</button>
+        </form>
+      </div>
+      <div id="query-results" class="query-results"></div>
+    </div>
+  </section>
+</main>
+
+<div class="modal" id="session-modal" aria-hidden="true">
+  <div class="modal-backdrop" data-close></div>
+  <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <header class="modal-head">
+      <div class="modal-title-group">
+        <div class="modal-title" id="modal-title">—</div>
+        <div class="modal-subtitle" id="modal-subtitle">—</div>
+      </div>
+      <div class="modal-class" id="modal-class">—</div>
+      <button class="modal-close" aria-label="close" data-close>×</button>
+    </header>
+    <div class="modal-body" id="modal-body" data-i18n="common.loading">loading…</div>
+    <footer class="modal-foot">
+      <div class="muted tiny" data-i18n="modal.close_hint">Press Esc or click outside to close.</div>
+    </footer>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+<script src="/static/app.manager.js"></script>
+</body>
+</html>

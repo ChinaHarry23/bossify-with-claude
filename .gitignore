@@ -1,0 +1,30 @@
+# Runtime data — contains real Claude Code session history.
+# This MUST NEVER be committed: it includes user prompts, tool outputs,
+# memory writes, and employees.json with real names.
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo

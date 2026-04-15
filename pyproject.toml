@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bossify-with-claude"
+version = "0.1.0"
+description = "新时代老板 (Bossify with Claude) — local-first flight recorder + ROI analyzer for agentic coding sessions."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "bossify-with-claude" }]
+keywords = ["claude", "claude-code", "agents", "observability", "roi", "token-attribution"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries",
+]
+# Core dependencies are empty by design — the library works with the stdlib
+# alone. Optional features (embeddings, dashboard, OTEL, Anthropic SDK) are
+# pulled in through extras.
+dependencies = []
+
+[project.optional-dependencies]
+dashboard = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.27",
+  "jinja2>=3.1",
+]
+embeddings = [
+  "sentence-transformers>=2.5",
+  "numpy>=1.26",
+]
+otel = [
+  "opentelemetry-sdk>=1.23",
+  "opentelemetry-exporter-otlp-proto-grpc>=1.23",
+]
+anthropic = [
+  "anthropic>=0.25",
+]
+dev = [
+  "pytest>=8.0",
+  "pytest-cov>=5.0",
+]
+
+[project.scripts]
+token-roi = "token_roi.cli:main"
+
+[project.urls]
+Documentation = "file://./SKILL.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/token_roi"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/hooks",
+  "/references",
+  "/tests",
+  "/SKILL.md",
+  "/README.md",
+  "/pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+filterwarnings = ["error"]
