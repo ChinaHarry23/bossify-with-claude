@@ -40,7 +40,7 @@ and get a **boss-facing dashboard that names names**
 
 ---
 
-Created by [@chinaharry](https://github.com/chinaharry) | Master of Computer Science, University of Sydney
+Created by [@chinaharry](https://github.com/chinaharry) 
 
 ## What it is
 

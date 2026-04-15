@@ -40,7 +40,7 @@
 
 ---
 
-作者：[@chinaharry](https://github.com/chinaharry) | 悉尼大学 计算机科学硕士
+作者：[@chinaharry](https://github.com/chinaharry)
 
 ## 是什么
 
