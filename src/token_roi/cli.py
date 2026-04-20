@@ -186,6 +186,41 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--timeout", type=int, default=120)
     s.set_defaults(func=cmd_name_sessions)
 
+    # name-projects
+    s = sub.add_parser(
+        "name-projects",
+        help="Use the local LLM to group sessions into named projects and "
+             "produce a plain-language display name + description for each.",
+    )
+    s.add_argument("--endpoint", type=str, default="http://localhost:1234/v1")
+    s.add_argument("--model", type=str, default=None)
+    s.add_argument("--force", action="store_true",
+                   help="Re-name projects that already have a cached name.")
+    s.add_argument("--timeout", type=int, default=120)
+    s.set_defaults(func=cmd_name_projects)
+
+    # nuclear — wipe derived data and re-run the whole pipeline.
+    s = sub.add_parser(
+        "nuclear",
+        help="Wipe all derived state and re-run the whole pipeline. "
+             "Preserves employees.json and your raw Claude Code history.",
+    )
+    s.add_argument("--yes", action="store_true",
+                   help="Skip the 'are you sure?' prompt.")
+    s.add_argument("--endpoint", type=str, default=None,
+                   help="OpenAI-compatible LLM endpoint (forwarded to "
+                        "judge / name-sessions / name-projects).")
+    s.add_argument("--model", type=str, default=None,
+                   help="LLM model id forwarded to every LLM step.")
+    s.add_argument("--timeout", type=int, default=None,
+                   help="Per-call LLM HTTP timeout in seconds.")
+    s.add_argument("--skip-judge", action="store_true",
+                   help="Skip the `judge` step (fastest path — useful for "
+                        "smoke-testing the import + score plumbing).")
+    s.add_argument("--skip-name", action="store_true",
+                   help="Skip the `name-sessions` and `name-projects` steps.")
+    s.set_defaults(func=cmd_nuclear)
+
     # judge
     s = sub.add_parser(
         "judge",
@@ -210,15 +245,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_judge)
 
     # import
+    from .importers import list_sources, get_importer  # noqa: F401
     s = sub.add_parser(
         "import",
-        help="Import session history from an external source (Claude Code, ...).",
+        help="Import session history from Claude Code, Codex, Cursor, Aider, "
+             "or a generic OpenAI JSONL log.",
     )
-    s.add_argument("source", choices=["claude-code"],
+    s.add_argument("source", choices=list_sources(),
                    help="Which external log format to import.")
-    s.add_argument("--from", dest="from_path", type=Path,
-                   default=Path("~/.claude/projects").expanduser(),
-                   help="Path to scan (file, project dir, or projects root).")
+    s.add_argument("--from", dest="from_path", type=Path, default=None,
+                   help="Path to scan (file, project dir, or projects root). "
+                        "Defaults to the importer's canonical location.")
     s.add_argument("--project", type=str, default=None,
                    help="Filter by project slug substring (e.g. 'Bossify').")
     s.set_defaults(func=cmd_import)
@@ -332,6 +369,13 @@ def cmd_score(args) -> int:
     if store.list_sessions():
         db.rebuild_from(store.iter_all_sessions())
 
+    # Clean up data left over by previous pipeline versions before
+    # scoring runs: synthetic-prompt attributions from the un-filtered
+    # importer, and stale aggregate values from the pre-efficiency
+    # formula. Cheap no-ops once the cache is already clean.
+    purged = db.purge_synthetic_prompts()
+    recomputed = db.recompute_llm_aggregates()
+
     graph = AttributionGraph(db)
     classifier = ROIClassifier(db)
 
@@ -348,13 +392,29 @@ def cmd_score(args) -> int:
     sessions_scored = classifier.score_all_sessions()
     memory_scored = classifier.score_all_memory_writes()
 
-    summary = db.roi_summary()
-
+    if purged["synthetic_found"]:
+        print(f"purged synthetic prompts: {purged['synthetic_found']} "
+              f"(attributions={purged['attributions']}, "
+              f"judgments={purged['judgments']}, roi_scores={purged['roi_scores']})")
+    if recomputed:
+        print(f"recomputed {recomputed} LLM aggregate(s) under the new formula.")
     print(f"sessions={len(sessions)} prompt_attributions={total_prompts} "
           f"prompts_scored={prompts_scored} sessions_scored={sessions_scored} "
           f"memory_writes_scored={memory_scored}")
-    for cls, n in sorted(summary.items()):
-        print(f"  {cls:<18} {n}")
+
+    # Break the ROI distribution out per scope so prompt-level counts
+    # don't get silently added to session-level counts. We always print
+    # all four classes, including zeros, so "HIGH_VALUE 0" is explicit
+    # rather than mysteriously missing.
+    classes = ("HIGH_VALUE", "TRANSIENT_VALUE", "LOW_VALUE", "WASTED")
+    prompt_summary  = db.roi_summary(scope_kind="prompt")
+    session_summary = db.roi_summary(scope_kind="session")
+    print("\n  per-prompt ROI distribution:")
+    for cls in classes:
+        print(f"    {cls:<18} {prompt_summary[cls]}")
+    print("  per-session ROI distribution:")
+    for cls in classes:
+        print(f"    {cls:<18} {session_summary[cls]}")
     return 0
 
 
@@ -570,6 +630,156 @@ def cmd_name_sessions(args) -> int:
     return 0
 
 
+def cmd_nuclear(args) -> int:
+    """Wipe all derived state and re-run the whole pipeline from scratch.
+
+    Preserves:
+        - Your Claude Code history under ``~/.claude/projects/`` (Bossify
+          never writes there — all Bossify data lives under ``data/``).
+        - ``data/employees.json`` — briefly backed up to /tmp and
+          restored after the data dir is re-initialised.
+
+    Wipes:
+        - ``data/raw_events``     (re-created by ``import``)
+        - ``data/analytics``      (re-created by ``score``)
+        - ``data/memory``         (re-created by ``compress``)
+        - ``data/retrieval``      (re-created by ``index-memory``)
+        - ``data/snapshots``      (empty on first run)
+        - every LLM judgment + session/project name (re-created by
+          ``judge``, ``name-sessions``, ``name-projects``).
+
+    Use this when the derived data is in a state you can't recover from
+    incrementally. For routine refresh after new sessions, prefer
+    ``token-roi import claude-code && token-roi score``.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    data_dir: Path = args.data_dir
+
+    # Confirmation gate — skippable with --yes.
+    if not args.yes:
+        print("=" * 70)
+        print("token-roi nuclear")
+        print("=" * 70)
+        print(f"  will DELETE everything under: {data_dir}")
+        print( "  will PRESERVE:                ~/.claude/projects/")
+        print( "                                data/employees.json (backed up)")
+        print()
+        try:
+            resp = input("Type 'yes' to proceed: ").strip().lower()
+        except EOFError:
+            resp = ""
+        if resp not in {"yes", "y"}:
+            print("aborted.")
+            return 1
+
+    # Back up employees.json. /tmp is clobber-safe on reboot so a second
+    # nuclear run won't read a stale backup from a past session.
+    employees_path = data_dir / "employees.json"
+    backup_path = Path(tempfile.gettempdir()) / "token-roi-employees.json.bak"
+    employees_backed_up = False
+    if employees_path.exists():
+        shutil.copy(employees_path, backup_path)
+        employees_backed_up = True
+        print(f"✓ backed up {employees_path} → {backup_path}")
+
+    # Wipe the data dir. This is the destructive step.
+    if data_dir.exists():
+        shutil.rmtree(data_dir)
+        print(f"✓ wiped {data_dir}")
+
+    # Run each pipeline step in its own subprocess so (a) each step
+    # streams its own output live, (b) a failure in one step cleanly
+    # halts the rest, and (c) DB connections don't leak between phases.
+    # Fail-fast: any non-zero return aborts the remainder.
+    def llm_args() -> list[str]:
+        out: list[str] = []
+        if args.model:
+            out += ["--model", args.model]
+        if args.endpoint:
+            out += ["--endpoint", args.endpoint]
+        if args.timeout:
+            out += ["--timeout", str(args.timeout)]
+        return out
+
+    def run(label: str, *subcmd: str) -> int:
+        cmd = [sys.executable, "-m", "token_roi.cli"]
+        if getattr(args, "locale", None):
+            cmd += ["--locale", args.locale]
+        cmd += ["--data-dir", str(data_dir), *subcmd]
+        print(f"\n━━━ {label} ━━━")
+        print(f"$ {' '.join(cmd)}")
+        rc = subprocess.run(cmd).returncode
+        if rc != 0:
+            print(f"✗ {label} failed with exit code {rc}. halting nuclear.")
+        return rc
+
+    # 1. Re-init the data dir + stub files + schema.
+    if (rc := run("init", "init")) != 0:
+        return rc
+
+    # 2. Restore employees.json before the importer runs so sessions get
+    #    tagged with the right employee_id from the start.
+    if employees_backed_up:
+        shutil.copy(backup_path, employees_path)
+        print(f"✓ restored {employees_path}")
+
+    # 3. Import Claude Code history from ~/.claude/projects/.
+    if (rc := run("import claude-code", "import", "claude-code")) != 0:
+        return rc
+
+    # 4. First score pass — attribution + pure-math classification.
+    if (rc := run("score (pre-judge)", "score")) != 0:
+        return rc
+
+    # 5. LLM judge — the long pole (~20-30s per prompt).
+    if not args.skip_judge:
+        if (rc := run("judge", "judge", *llm_args())) != 0:
+            return rc
+        # 6. Second score pass folds LLM verdicts into the final class.
+        if (rc := run("score (post-judge)", "score")) != 0:
+            return rc
+
+    # 7. LLM-produced display names for sessions and projects.
+    if not args.skip_name:
+        if (rc := run("name-sessions", "name-sessions", *llm_args())) != 0:
+            return rc
+        if (rc := run("name-projects", "name-projects", *llm_args())) != 0:
+            return rc
+
+    print()
+    print("=" * 70)
+    print("✓ nuclear rebuild complete")
+    print("=" * 70)
+    print()
+    print("next:  token-roi dashboard     # open http://127.0.0.1:8787")
+    print()
+    return 0
+
+
+def cmd_name_projects(args) -> int:
+    """Group sessions by Claude Code project slug and ask the local LLM
+    for a human-readable display name + one-line description per project.
+    Idempotent: re-running skips already-named projects unless --force."""
+    from .llm_judge import Judge, LocalLLM
+    db = AnalyticsDB(args.data_dir / "analytics" / "roi.db")
+    db.migrate()
+    llm = LocalLLM(endpoint=args.endpoint, model=args.model, timeout_s=args.timeout)
+    if not llm.health():
+        print(f"LLM endpoint not reachable at {args.endpoint}. "
+              "Is LM Studio / Ollama running?", file=sys.stderr)
+        return 2
+    judge = Judge(db, llm)
+    n = 0
+    for _ in judge.summarize_projects(force=args.force, progress=True):
+        n += 1
+    total = db._conn.execute("SELECT COUNT(*) AS n FROM projects").fetchone()["n"]
+    print(f"\nnamed {n} new project(s); {total} total named.")
+    return 0
+
+
 def cmd_judge(args) -> int:
     """Run local-LLM value judgments over prompts."""
     from .llm_judge import Judge, LocalLLM
@@ -616,29 +826,25 @@ def cmd_judge(args) -> int:
 
 
 def cmd_import(args) -> int:
+    from .importers import get_importer
     store = EventStore(args.data_dir)
     db = AnalyticsDB(args.data_dir / "analytics" / "roi.db")
     db.migrate()
     registry = EmployeeRegistry(args.data_dir)
-    if args.source == "claude-code":
-        from .importers.claude_code import ClaudeCodeImporter
-        imp = ClaudeCodeImporter(store, db=db, employees=registry)
-        stats = imp.import_path(args.from_path, project_filter=args.project)
-        print(json.dumps(stats.to_dict(), indent=2))
-        # Rebuild the index so subsequent commands see the imported events.
-        db.rebuild_from(store.iter_all_sessions())
-        print(f"indexed {len(store.list_sessions())} session(s) after import.")
-        # Per-employee rollup gives the manager an immediate sense of how
-        # the new sessions got attributed.
-        employees = db.employees_with_stats(registry)
-        if employees:
-            print()
-            print("per-employee rollup:")
-            for e in employees:
-                print(f"  {e['name']:<20} sessions={e['session_count']:>3} "
-                      f"cost={e['total_cost']:>12,}")
-        return 0
-    raise ValueError(f"unknown source: {args.source}")
+    imp = get_importer(args.source, store, db=db, employees=registry)
+    path = args.from_path or imp.default_path()
+    stats = imp.import_path(path, project_filter=args.project)
+    print(json.dumps(stats.to_dict(), indent=2))
+    db.rebuild_from(store.iter_all_sessions())
+    print(f"indexed {len(store.list_sessions())} session(s) after import.")
+    employees = db.employees_with_stats(registry)
+    if employees:
+        print()
+        print("per-employee rollup:")
+        for e in employees:
+            print(f"  {e['name']:<20} sessions={e['session_count']:>3} "
+                  f"cost={e['total_cost']:>12,}")
+    return 0
 
 
 def cmd_dashboard(args) -> int:

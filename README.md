@@ -55,19 +55,25 @@ Bossify treats agentic token usage as **capital allocation** and asks a local LL
 
 ## The dashboard
 
-Three tabs, served locally at **http://127.0.0.1:8787**:
+Four tabs, served locally at **http://127.0.0.1:8787**:
 
 | Tab | What it shows |
 |---|---|
-| 📊 **Team Overview** / 团队总览 | Boss-first KPIs, top waste patterns, leaderboard by employee |
-| 🧑‍💻 **Employees** / 员工 | Card grid — one per person with ROI mix, top sessions, waste examples |
-| 🔬 **Advanced** / 高级 | Token flow over time, memory effectiveness scatter, tool treemap, session drill-down |
+| 📊 **Overview** / 总览 | Hero KPIs in **USD** (priced per-model), cost-per-KB-shipped, team ROI distribution, top waste patterns, biggest-money-burner leaderboard |
+| 🧑‍💻 **People** / 成员 | Card grid — one per person with ROI mix, top sessions, waste examples |
+| 📁 **Projects** / 项目 | One card per workspace, ranked by USD spend, with **model-mix pills** (Opus / Sonnet / Haiku share), cost-per-KB, and ROI distribution |
+| 🔬 **Technical detail** / 技术细节 | Token flow over time, memory effectiveness scatter, tool treemap, per-prompt LLM verdicts, session drill-down |
+
+Click any project card, employee card, or leaderboard row to drill into a full session-by-session breakdown with USD cost + per-session model mix.
 
 ---
 
 ## Install
 
-> **Important**: requires Python 3.11+ and a local LLM server (LM Studio or Ollama) running on `http://localhost:1234/v1`.
+> **Prerequisites**
+> - Python **3.11+**
+> - A local LLM server — [LM Studio](https://lmstudio.ai/) or [Ollama](https://ollama.com/) — running on `http://localhost:1234/v1` with at least one instruct model loaded (a 4–8B model is plenty for the judge; GLM-4.x and Gemma-3 work well).
+> - (Optional) **Claude Code** already installed and in use — Bossify reads its session history from `~/.claude/projects/`.
 
 ```bash
 git clone https://github.com/chinaharry/bossify-with-claude
@@ -78,25 +84,90 @@ token-roi init
 
 Optional extras: `otel` (OpenTelemetry export), `anthropic` (Agent SDK wrapper), `dev` (pytest).
 
+### Supported sources
+
+`token-roi import <source>` pulls session history from any of:
+
+- **claude-code** — JSONL under `~/.claude/projects/`. Full token usage, tool calls, and file-edit events. This is the reference importer.
+- **codex** — OpenAI Codex CLI session logs under `~/.codex/sessions/`. Maps `message` / `function_call` / `function_call_output` / `token_count` records into typed events. Schema varies across Codex versions; the importer is lenient and skips unknown record types.
+- **cursor** — Cursor IDE chat history from the `state.vscdb` SQLite stores under Cursor's user directory. **Caveat:** Cursor sessions typically lack token usage unless you run Cursor in API-key / OpenRouter mode that records usage — imported events will have zero token attribution otherwise.
+- **aider** — `.aider.chat.history.md` transcripts, enriched with token counts from a sibling `.aider.llm.history` when present. Fenced code blocks whose info-string looks like a file path are promoted to `FILE_WRITE` events.
+- **openai-jsonl** — Generic OpenAI Responses API / Chat Completions JSONL logs. Reads `input` / `output` / `usage` per line and emits the corresponding user / assistant / tool-call events.
+
 ---
 
-## Personal audit — quick start
+## First run — full pipeline walkthrough
 
-Retrospectively ingest everything you've ever done in Claude Code:
+Brand new user? Run these five commands in order. The whole thing is local-first — no prompts, code, or tokens leave your machine. Expect roughly 15–30 seconds of LLM work per prompt on a mid-range laptop, so the `judge` step is the long pole on a big history.
 
 ```bash
-token-roi import claude-code                    # pulls ~/.claude/projects/*/*.jsonl
-token-roi score                                  # attribution + ROI classifier
-token-roi judge --model zai-org/glm-4.7-flash    # local-LLM verdict per prompt
-token-roi name-sessions                          # short human-readable session names
-token-roi dashboard                              # open http://127.0.0.1:8787
+# 1. Pull every Claude Code session you've ever run into the event store.
+#    Idempotent — safe to re-run any time new sessions land.
+token-roi import claude-code
+
+# Also supported:
+token-roi import codex                    # OpenAI Codex CLI (~/.codex/sessions)
+token-roi import cursor                   # Cursor IDE chat history
+token-roi import aider --from ~/projects  # Aider .aider.chat.history.md files
+token-roi import openai-jsonl --from path/to/log.jsonl
+
+# 2. Re-build the analytics index from raw events, run attribution, and
+#    classify every prompt + session (HIGH_VALUE / TRANSIENT / LOW_VALUE /
+#    WASTED). Also auto-cleans out Claude Code's slash-command plumbing
+#    and re-computes LLM aggregates under the latest formula.
+token-roi score
+
+# 3. Ask the local LLM to read each prompt + its output and rate
+#    meaningful value, durability, code quality, and efficiency.
+#    Replace the --model id with whatever you have loaded in LM Studio /
+#    Ollama. --list-models will print what's available.
+token-roi judge --model glm-4.7-flash
+
+# 4. Roll the judgments back into ROI scores (the judge's verdict
+#    overrides the pure-math score when present).
+token-roi score
+
+# 5. Two LLM labelling passes — one per session, one per project.
+#    Both are idempotent; re-running skips already-named rows.
+token-roi name-sessions                  # human-readable session titles
+token-roi name-projects                  # LLM names your Claude Code workspaces
+
+# 6. Open the boss dashboard.
+token-roi dashboard                      # → http://127.0.0.1:8787
 ```
 
-No prompts leave your machine. Pinky promise, and it's enforced by the fact that there's no network code.
+After this you'll land on the Overview tab with your real USD spend, cost-per-KB-shipped, ROI distribution, and the biggest-money-burner leaderboard. Switch to the Projects tab to see how your spend splits across workspaces + models.
+
+> **Prefer 中文 UI?** Prefix any command with `--locale zh` (or set `TOKEN_ROI_LOCALE=zh`) — the LLM judge and dashboard both switch to Simplified Chinese.
+
+### After a new coding session
+
+When you've done more Claude Code work and want to refresh the dashboard:
+
+```bash
+token-roi import claude-code && token-roi score && token-roi judge && token-roi score
+token-roi name-sessions && token-roi name-projects
+```
+
+`import` and every LLM step are content-addressed — anything already done gets skipped.
+
+### Starting over from scratch
+
+If the derived data is in a broken state (corrupt DB, stale judgments from an older model, etc.), `token-roi nuclear` wipes everything under `data/` and re-runs the full pipeline. It preserves `employees.json` (briefly backed up to `/tmp`) and your Claude Code history (it lives in `~/.claude/projects/`, which Bossify never writes to).
+
+```bash
+token-roi nuclear --model glm-5.1-ram-420gb-mlx          # prompts "Type 'yes' to proceed"
+token-roi nuclear --yes --model glm-5.1-ram-420gb-mlx    # skip the confirmation
+token-roi nuclear --yes --skip-judge --skip-name         # import + score only (fast)
+```
+
+Expect ~40 min of LLM work on a full history; the `--skip-judge` variant returns in seconds.
+
+---
 
 ## Team audit — manager workflow
 
-Define your team in `data/employees.json`:
+Once you have more than one person's history to review, define the team in `data/employees.json`:
 
 ```json
 {
@@ -112,12 +183,14 @@ Define your team in `data/employees.json`:
 }
 ```
 
-Run the full pipeline in your team's preferred language:
+Point the importer at a directory that contains every teammate's `~/.claude/projects/` tree (e.g. a shared drive mount or a git-synced dir):
 
 ```bash
-token-roi --locale zh import claude-code
+token-roi --locale zh import claude-code --from /path/to/team/claude-projects
 token-roi --locale zh score
 token-roi --locale zh judge
+token-roi --locale zh name-sessions
+token-roi --locale zh name-projects
 token-roi --locale zh dashboard
 ```
 
@@ -125,11 +198,12 @@ token-roi --locale zh dashboard
 
 | Command | Description |
 |---------|-------------|
-| `token-roi employees list` | Per-employee rollup |
+| `token-roi employees list` | Per-employee rollup (USD, sessions, ROI mix) |
 | `token-roi employees show alice` | Drill into one person |
 | `token-roi view black_holes.sql` | Sessions with the lowest value-per-token |
 | `token-roi view orphan_memory.sql` | Memory writes that are never re-read |
-| `token-roi explain --kind session --id <ID>` | Full derivation of one score |
+| `token-roi explain --kind session --id <ID>` | Full derivation of one score — the exact events, memory writes, and LLM reasoning behind a verdict |
+| `token-roi name-projects --force` | Re-generate project names (e.g. after editing the `PROJECT_SUMMARY_SYSTEM_PROMPT`) |
 
 ---
 
@@ -214,6 +288,20 @@ See [SKILL.md](SKILL.md) for the full CLI surface and [references/](references/)
 
 ---
 
+## Troubleshooting
+
+**Projects tab is empty.** You're probably running a dashboard started before a recent code update. Stop the dashboard (Ctrl-C), restart (`token-roi dashboard`), and hard-refresh your browser (Cmd-Shift-R / Ctrl-Shift-R).
+
+**Session names are blank on the dashboard.** Run `token-roi name-sessions`. If it says "0 new sessions named" but names still look empty, the importer pre-populated placeholder rows — a fresh run on the latest code picks those up correctly.
+
+**Dashboard shows "$0.00" for a real session.** That session's events were imported without `model` metadata (e.g. from a pre-usage-field SDK wrapper). Bossify falls back to Opus 4.x pricing on unknown-model events; if a big chunk of events truly lack a model, the per-session total is just that fallback total.
+
+**The LLM judge is too slow / crashes.** The judge needs roughly 15–30 s per prompt on a mid-range laptop. Options: pass `--limit 20` for a quick smoke test, run `token-roi judge --session <id>` to judge just one session, or switch to a smaller/faster model (`--model gemma-3-4b` is a reasonable floor for the adversarial rubric).
+
+**"LLM endpoint not reachable."** LM Studio / Ollama isn't running, or it's not serving an OpenAI-compatible endpoint on port 1234. Use `--endpoint http://localhost:11434/v1` for a default Ollama install.
+
+---
+
 ## Development
 
 ```bash
@@ -221,7 +309,7 @@ python -m pip install -e '.[dev]'
 pytest
 ```
 
-22 tests cover the core paths: event storage, attribution graph, ROI classifier, compression, retrieval, hook integration, and the CLI.
+54 tests cover the core paths: event storage, attribution graph, ROI classifier, pricing lookup, synthetic-prompt filtering, aggregate formula, cost roll-ups, hook integration, project grouping, and the CLI.
 
 ---
 

@@ -83,6 +83,17 @@ COST_FLOOR = 0.25
 FILE_WRITE_DURABLE_WEIGHT = 0.8    # file writes count close-to-full-strength
 FILE_WRITE_LOG_CEILING    = 20000  # 20 KB of file writes saturates the proxy
 
+# ---- cross-turn propagation weights ----
+# A review prompt doesn't produce artefacts of its own — the fix prompt
+# that follows does. ``attribution.propagated_bytes`` carries a decayed
+# fraction of that downstream durable output. We fold it into v_durable
+# at half the weight of a direct byte (the review didn't write the byte
+# itself, it just specified it), and bump the class up one tier when the
+# propagated total crosses a meaningful threshold so the dashboard stops
+# labelling fruitful reviews as WASTED.
+PROPAGATION_DURABLE_WEIGHT = 0.5
+PROPAGATION_BUMP_THRESHOLD = 1000   # 1 KB of downstream durable output triggers a bump
+
 TOOL_SUCCESS_POS_THRESHOLD = 0.85  # success rate at/above this is a positive outcome proxy
 TOOL_SUCCESS_NEG_THRESHOLD = 0.60  # success rate below this is a negative outcome proxy
 TOOL_SUCCESS_MIN_CALLS     = 3     # need at least this many tool calls for the proxy
@@ -164,7 +175,14 @@ class ROIClassifier:
         v_durable_files = FILE_WRITE_DURABLE_WEIGHT * _log_saturate(
             attribution.file_write_bytes, FILE_WRITE_LOG_CEILING
         )
-        v_durable = max(v_durable_mem, v_durable_files)
+        # Propagated bytes: durable output credited back from a later
+        # prompt in the same session (the review → fix pattern). Half
+        # weight because the prompt didn't actually write the artefact,
+        # it just enabled it.
+        v_durable_propagated = PROPAGATION_DURABLE_WEIGHT * _log_saturate(
+            attribution.propagated_bytes, DURABLE_LOG_CEILING
+        )
+        v_durable = max(v_durable_mem, v_durable_files, v_durable_propagated)
 
         # Tool success rate as a soft outcome signal. Requires a minimum
         # number of tool calls so a single lucky Bash doesn't move the score.
@@ -194,17 +212,32 @@ class ROIClassifier:
             score, attribution,
             v_llm=v_llm if llm_weight else None,
             llm_efficiency=(float(llm_row["efficiency"]) if llm_row is not None else None),
+            llm_meaningful=(float(llm_row["meaningful_value"]) if llm_row is not None else None),
         )
+        # Propagation bump: if a non-trivial downstream artefact was
+        # credited back, bump the class up one tier (capped at
+        # TRANSIENT_VALUE — cross-session reuse is still the only path
+        # to HIGH_VALUE). This reflects "the fix prompt wouldn't have
+        # existed without this review; it deserves some credit".
+        if attribution.propagated_bytes >= PROPAGATION_BUMP_THRESHOLD:
+            cls = _bump_one_tier(cls)
 
+        v_durable_picked = (
+            "memory_bytes"   if v_durable == v_durable_mem        else
+            "file_writes"    if v_durable == v_durable_files      else
+            "propagated"     if v_durable == v_durable_propagated else
+            "memory_bytes"
+        )
         derivation = {
             "formula": "numerator / denominator",
             "numerator": {
                 "weights": weights_effective,
                 "v_durable": v_durable,
                 "v_durable_components": {
-                    "memory_bytes": v_durable_mem,
+                    "memory_bytes":     v_durable_mem,
                     "file_write_proxy": v_durable_files,
-                    "picked": "memory_bytes" if v_durable_mem >= v_durable_files else "file_write_proxy",
+                    "propagated":       v_durable_propagated,
+                    "picked":           v_durable_picked,
                 },
                 "v_reuse": v_reuse,
                 "v_outcome": v_outcome,
@@ -237,6 +270,8 @@ class ROIClassifier:
                 "tool_calls": attribution.tool_calls,
                 "tool_successes": attribution.tool_successes,
                 "tool_success_rate": success_rate,
+                "propagated_bytes": attribution.propagated_bytes,
+                "propagated_from":  attribution.propagated_from,
             },
             "contributions": {
                 "cost_events": attribution.cost_event_ids,
@@ -414,6 +449,8 @@ class ROIClassifier:
                 file_write_bytes=r["file_write_bytes"] or 0,
                 tool_calls=r["tool_calls"] or 0,
                 tool_successes=r["tool_successes"] or 0,
+                propagated_bytes=r["propagated_bytes"] or 0,
+                propagated_from=_json.loads(r["propagated_from_json"] or "[]"),
                 cost_event_ids=_json.loads(r["cost_event_ids_json"] or "[]"),
                 memory_write_ids=_json.loads(r["memory_write_ids_json"] or "[]"),
                 retrieval_hit_event_ids=_json.loads(r["retrieval_hit_ids_json"] or "[]"),
@@ -460,12 +497,31 @@ def _log_saturate(x: float, ceiling: float) -> float:
     return math.log1p(x) / math.log1p(ceiling)
 
 
+_TIER_ORDER = (ROIClass.WASTED, ROIClass.LOW_VALUE,
+               ROIClass.TRANSIENT_VALUE, ROIClass.HIGH_VALUE)
+
+
+def _bump_one_tier(cls: ROIClass) -> ROIClass:
+    """Promote to the next ROI tier, capping at TRANSIENT_VALUE.
+
+    Propagation alone should never push to HIGH_VALUE — that tier is
+    reserved for prompts whose artefacts were re-used in a LATER
+    session. Propagation measures within-session review → fix flow,
+    which is a real signal but a weaker one than cross-session reuse.
+    """
+    i = _TIER_ORDER.index(cls)
+    if i >= _TIER_ORDER.index(ROIClass.TRANSIENT_VALUE):
+        return cls
+    return _TIER_ORDER[i + 1]
+
+
 def _classify(
     score: float,
     a: Attribution,
     *,
     v_llm: float | None = None,
     llm_efficiency: float | None = None,
+    llm_meaningful: float | None = None,
 ) -> ROIClass:
     # ---- hard WASTED gate ----
     # Negative outcome with no offsetting value. File writes count against
@@ -491,10 +547,15 @@ def _classify(
     #   v_llm >= 0.85                        → TRANSIENT (efficiency drag)
     #   v_llm >= 0.60                        → TRANSIENT
     #   v_llm >= 0.35                        → LOW_VALUE
-    #   v_llm <  0.35                        → WASTED
+    #   v_llm <  0.35                        → LOW_VALUE iff meaningful >= 0.5
+    #                                           else WASTED
     #
-    # The math-based threshold classification below remains the fallback
-    # when no judgment is cached.
+    # The `meaningful >= 0.5` floor protects analysis prompts: a code
+    # review that finds real bugs but produces no artifact is
+    # ephemeral-but-not-worthless, which is what LOW_VALUE means. Pure
+    # WASTED is reserved for prompts the LLM couldn't find content
+    # value in at all (meaningful < 0.5), OR prompts with no LLM
+    # judgment that fall below the math-only WASTED threshold.
     if v_llm is not None:
         eff = llm_efficiency if llm_efficiency is not None else 0.5
         if v_llm >= 0.85 and eff >= 0.7:
@@ -504,6 +565,12 @@ def _classify(
         if v_llm >= 0.60:
             return ROIClass.TRANSIENT_VALUE
         if v_llm >= 0.35:
+            return ROIClass.LOW_VALUE
+        # Aggregate dragged below 0.35 by a low efficiency/durability,
+        # but if the LLM still found the content meaningful, rescue
+        # from WASTED → LOW_VALUE. This is the "real work, just not
+        # captured durably" case (e.g. a code review in chat).
+        if llm_meaningful is not None and llm_meaningful >= 0.5:
             return ROIClass.LOW_VALUE
         return ROIClass.WASTED
 

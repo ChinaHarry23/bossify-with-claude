@@ -71,7 +71,7 @@ def on_pre_tool_use(payload: dict, store: EventStore) -> None:
     tool_name = payload.get("tool_name") or payload.get("tool", {}).get("name") or "unknown"
     tool_input = payload.get("tool_input") or payload.get("input") or {}
     store.append(make_event(
-        session_id=sid, seq=store._next_seq(sid),
+        session_id=sid, seq=store.next_seq(sid),
         type=EventType.PRE_TOOL_USE,
         payload={"tool_name": tool_name, "input": tool_input},
     ))
@@ -85,7 +85,7 @@ def on_post_tool_use(payload: dict, store: EventStore, memory: MemoryLayer | Non
     success = bool(payload.get("success", True))
 
     post = store.append(make_event(
-        session_id=sid, seq=store._next_seq(sid),
+        session_id=sid, seq=store.next_seq(sid),
         type=EventType.POST_TOOL_USE,
         payload={
             "tool_name": tool_name,
@@ -98,6 +98,28 @@ def on_post_tool_use(payload: dict, store: EventStore, memory: MemoryLayer | Non
     # Promote file/memory touches to their own typed events so ROI queries
     # don't have to parse tool payloads.
     _promote_file_touch(store, sid, tool_name, tool_input, tool_output, memory, parent=post.id)
+
+
+def _infer_write_bytes(tool_name: str, tool_input: dict) -> int:
+    """Best-effort byte count for the new content of a write-type tool.
+
+    MultiEdit sums the ``new_string`` of every edit in the batch — a previous
+    implementation looked at a top-level ``new_string`` that MultiEdit does
+    not carry, silently tracking zero bytes for every batch edit.
+    """
+    if tool_name == "MultiEdit":
+        total = 0
+        for edit in tool_input.get("edits") or []:
+            if isinstance(edit, dict):
+                s = edit.get("new_string")
+                if isinstance(s, str):
+                    total += len(s.encode("utf-8"))
+        return total
+    for key in ("new_string", "new_source", "content"):
+        s = tool_input.get(key)
+        if isinstance(s, str):
+            return len(s.encode("utf-8"))
+    return 0
 
 
 def _promote_file_touch(
@@ -114,12 +136,11 @@ def _promote_file_touch(
     bytes_touched = 0
     is_write = False
     if tool_name in {"Read", "NotebookRead"}:
-        path = tool_input.get("file_path")
+        path = tool_input.get("file_path") or tool_input.get("notebook_path")
     elif tool_name in {"Write", "Edit", "NotebookEdit", "MultiEdit"}:
-        path = tool_input.get("file_path")
+        path = tool_input.get("file_path") or tool_input.get("notebook_path")
         is_write = True
-        content = tool_input.get("new_string") or tool_input.get("content") or ""
-        bytes_touched = len(content.encode("utf-8")) if isinstance(content, str) else 0
+        bytes_touched = _infer_write_bytes(tool_name, tool_input)
     if not path:
         return
 
@@ -129,7 +150,7 @@ def _promote_file_touch(
 
     if is_memory and is_write:
         store.append(make_event(
-            session_id=sid, seq=store._next_seq(sid),
+            session_id=sid, seq=store.next_seq(sid),
             type=EventType.MEMORY_WRITE,
             payload={"path": path, "content_hash": h, "bytes": bytes_touched,
                      "kind": "agent_edit"},
@@ -137,21 +158,21 @@ def _promote_file_touch(
         ))
     elif is_memory and not is_write:
         store.append(make_event(
-            session_id=sid, seq=store._next_seq(sid),
+            session_id=sid, seq=store.next_seq(sid),
             type=EventType.MEMORY_READ,
             payload={"path": path, "content_hash": h, "bytes": bytes_touched},
             parent_ids=(parent,),
         ))
     elif is_write:
         store.append(make_event(
-            session_id=sid, seq=store._next_seq(sid),
+            session_id=sid, seq=store.next_seq(sid),
             type=EventType.FILE_WRITE,
             payload={"path": path, "content_hash": h, "bytes": bytes_touched},
             parent_ids=(parent,),
         ))
     else:
         store.append(make_event(
-            session_id=sid, seq=store._next_seq(sid),
+            session_id=sid, seq=store.next_seq(sid),
             type=EventType.FILE_READ,
             payload={"path": path, "content_hash": h, "bytes": bytes_touched},
             parent_ids=(parent,),

@@ -45,8 +45,9 @@ from typing import Iterable, Iterator
 
 from ..db import AnalyticsDB
 from ..employees import EmployeeRegistry
-from ..events import EventType, make_event
+from ..events import EventType, is_synthetic_prompt, make_event
 from ..storage import EventStore
+from . import ImportStats, Importer, register
 
 log = logging.getLogger(__name__)
 
@@ -56,30 +57,20 @@ _READ_TOOLS = {"Read", "NotebookRead"}
 _WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 
 
-@dataclass
-class ImportStats:
-    files: int = 0
-    lines: int = 0
-    events_written: int = 0
-    user_prompts: int = 0
-    assistant_messages: int = 0
-    tool_uses: int = 0
-    tool_results: int = 0
-    file_reads: int = 0
-    file_writes: int = 0
-    skipped: int = 0
-
-    def to_dict(self) -> dict:
-        return self.__dict__.copy()
-
-
-class ClaudeCodeImporter:
+@register
+class ClaudeCodeImporter(Importer):
     """Imports one or more Claude Code session JSONL files.
 
     Usage:
         imp = ClaudeCodeImporter(store)
         stats = imp.import_path(Path.home() / ".claude/projects")
     """
+
+    source_name = "claude-code"
+
+    @classmethod
+    def default_path(cls) -> Path:
+        return Path("~/.claude/projects").expanduser()
 
     def __init__(
         self,
@@ -173,6 +164,13 @@ class ClaudeCodeImporter:
         # file events in O(1) without rescanning the session.
         uuid_to_event_id: dict[str, str] = {}
         tool_use_id_to_pre_event: dict[str, dict] = {}
+        # Claude Code splits one Anthropic assistant turn across N JSONL
+        # records — one per content block (thinking / text / tool_use) —
+        # and replicates the same cumulative `usage` block on every one.
+        # Counting each copy multiplies the true cost 2-5x for tool-heavy
+        # turns. We track which message.ids have already consumed the
+        # usage so only the first emitted event per turn carries it.
+        seen_message_ids: set[str] = set()
 
         for _, rec in raw_lines:
             t = rec.get("type")
@@ -184,7 +182,8 @@ class ClaudeCodeImporter:
                                 tool_use_id_to_pre_event, stats)
             elif t == "assistant":
                 self._emit_assistant(rec, session_id, uuid_to_event_id,
-                                     tool_use_id_to_pre_event, stats)
+                                     tool_use_id_to_pre_event,
+                                     seen_message_ids, stats)
             else:
                 stats.skipped += 1
 
@@ -205,11 +204,18 @@ class ClaudeCodeImporter:
         ts = _ts_of(rec)
 
         if isinstance(content, str):
+            # Drop Claude Code plumbing (slash-command wrappers, task
+            # notifications, post-compaction continuations). These look
+            # like user prompts but carry no intent — judging them inflates
+            # the WASTED column with fake zero-cost rows.
+            if is_synthetic_prompt(content):
+                stats.synthetic_prompts_dropped += 1
+                return
             # Real user prompt.
             parent_ids = _parent_tuple(parent_uuid, uuid_to_event_id)
             ev = self.store.append(make_event(
                 session_id=session_id,
-                seq=self.store._next_seq(session_id),
+                seq=self.store.next_seq(session_id),
                 type=EventType.USER_PROMPT,
                 payload={"text": content},
                 parent_ids=parent_ids,
@@ -269,16 +275,31 @@ class ClaudeCodeImporter:
         session_id: str,
         uuid_to_event_id: dict[str, str],
         tool_use_id_to_pre_event: dict[str, str],
+        seen_message_ids: set[str],
         stats: ImportStats,
     ) -> None:
         msg = rec.get("message") or {}
         content = msg.get("content") or []
-        usage = msg.get("usage") or {}
         model = msg.get("model")
         parent_uuid = rec.get("parentUuid")
         rec_uuid = rec.get("uuid") or ""
         ts = _ts_of(rec)
         parent_ids = _parent_tuple(parent_uuid, uuid_to_event_id)
+
+        # Only the *first* JSONL record we see for a given Anthropic
+        # message.id carries the usage block. Subsequent records are
+        # streaming fragments of the same turn, and their `usage` is a
+        # duplicate of the first — counting it again multiplies the real
+        # cost. tool_use ids across fragments are still distinct, so we
+        # keep emitting one event per record (to preserve tool-call
+        # chaining); we just zero out tokens after the first.
+        mid = msg.get("id") or ""
+        if mid and mid in seen_message_ids:
+            usage: dict = {}
+        else:
+            usage = msg.get("usage") or {}
+            if mid:
+                seen_message_ids.add(mid)
 
         text_parts: list[str] = []
         tool_uses: list[dict] = []

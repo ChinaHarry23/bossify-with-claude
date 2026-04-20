@@ -81,6 +81,11 @@ class EventStore:
         # Per-session seq cache. Reloaded lazily from disk on demand.
         self._seq: dict[str, int] = {}
 
+    @property
+    def malformed_events_skipped(self) -> int:
+        """Process-wide count of malformed JSONL lines seen by any reader."""
+        return _MALFORMED_EVENTS_SEEN["count"]
+
     # ---- session lifecycle ----
 
     def start_session(self, session_id: str | None = None) -> str:
@@ -107,7 +112,7 @@ class EventStore:
     def end_session(self, session_id: str) -> Event:
         return self.append(make_event(
             session_id=session_id,
-            seq=self._next_seq(session_id),
+            seq=self.next_seq(session_id),
             type=EventType.SESSION_END,
             payload={"session_id": session_id},
         ))
@@ -142,7 +147,7 @@ class EventStore:
 
     def append_user_prompt(self, sid: str, text: str, *, parent_ids: tuple[str, ...] = ()) -> Event:
         return self.append(make_event(
-            session_id=sid, seq=self._next_seq(sid),
+            session_id=sid, seq=self.next_seq(sid),
             type=EventType.USER_PROMPT, payload={"text": text},
             parent_ids=parent_ids,
         ))
@@ -161,7 +166,7 @@ class EventStore:
         latency_ms: int | None = None,
     ) -> Event:
         return self.append(make_event(
-            session_id=sid, seq=self._next_seq(sid),
+            session_id=sid, seq=self.next_seq(sid),
             type=EventType.ASSISTANT_MESSAGE, payload={"text": text},
             parent_ids=parent_ids,
             tokens_in=tokens_in, tokens_out=tokens_out,
@@ -188,13 +193,13 @@ class EventStore:
         analysis treats the pair as one atomic action.
         """
         pre = self.append(make_event(
-            session_id=sid, seq=self._next_seq(sid),
+            session_id=sid, seq=self.next_seq(sid),
             type=EventType.PRE_TOOL_USE,
             payload={"tool_name": tool_name, "input": input_},
             parent_ids=parent_ids,
         ))
         post = self.append(make_event(
-            session_id=sid, seq=self._next_seq(sid),
+            session_id=sid, seq=self.next_seq(sid),
             type=EventType.POST_TOOL_USE,
             payload={"tool_name": tool_name, "output": output, "success": success},
             parent_ids=(pre.id,),
@@ -263,13 +268,22 @@ class EventStore:
 
     # ---- internals ----
 
-    def _next_seq(self, session_id: str) -> int:
+    def next_seq(self, session_id: str) -> int:
+        """Allocate the next per-session sequence number.
+
+        Lazily rebuilt from disk on first access for a given session.
+        """
         if session_id not in self._seq:
             existing = self._locate_session_file(session_id)
             self._seq[session_id] = 0 if existing is None else self._max_seq_in_file(existing) + 1
         s = self._seq[session_id]
         self._seq[session_id] = s + 1
         return s
+
+    # Legacy alias. Internal callers used ``_next_seq`` before the method
+    # was promoted; keep it resolving so historical test fixtures and
+    # any third-party callers don't break.
+    _next_seq = next_seq
 
     def _session_files(self, session_id: str) -> list[Path]:
         hits: list[Path] = []
@@ -296,11 +310,18 @@ class EventStore:
         return mx
 
 
+# Process-wide tally of malformed JSONL lines seen by any reader in this
+# process. EventStore.malformed_events_skipped returns this count so the
+# dashboard can surface audit-trail gaps instead of letting them stay silent.
+_MALFORMED_EVENTS_SEEN: dict[str, int] = {"count": 0}
+
+
 def _read_jsonl(path: Path) -> Iterable[Event]:
     """Read a JSONL file, tolerating trailing truncation.
 
     A crash mid-write can leave a half line at the end; we log and skip it
     rather than abort, because the rest of the file is still ground truth.
+    Every skip bumps the process-wide counter so a human can notice.
     """
     if not path.exists():
         return
@@ -314,9 +335,11 @@ def _read_jsonl(path: Path) -> Iterable[Event]:
                 yield Event.from_json(line)
             except (json.JSONDecodeError, KeyError, ValueError) as e:
                 # Advance past broken line; subsequent lines are still valid.
+                _MALFORMED_EVENTS_SEEN["count"] += 1
                 import logging
-                logging.getLogger(__name__).warning(
-                    "skipping malformed event line %s:%d (%s)", path, lineno, e,
+                logging.getLogger(__name__).error(
+                    "skipping malformed event line %s:%d (%s): %r",
+                    path, lineno, e, line[:200],
                 )
                 continue
 

@@ -20,6 +20,7 @@ would then misclassify the `request` parameter as a required query string
 and every request to `/` would fail with HTTP 422.
 """
 import json
+import logging
 from pathlib import Path
 
 from ..attribution import AttributionGraph
@@ -32,6 +33,25 @@ from ..replay import ReplayOptions, Replayer
 from ..retrieval import RetrievalIndex
 from ..roi import ROIClassifier
 from ..storage import EventStore
+from ..pricing import format_currency
+
+
+log = logging.getLogger(__name__)
+
+
+def _safe_json_loads(raw: str | None, default):
+    """Parse a JSON blob from the DB, returning ``default`` on corruption.
+
+    One corrupt payload must not fail the whole API response; this keeps
+    the dashboard usable when a single event row has a malformed payload.
+    """
+    if not raw:
+        return default
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        log.warning("corrupt JSON in DB row (%s); using default", e)
+        return default
 
 
 def make_app(data_dir: Path):
@@ -55,9 +75,28 @@ def make_app(data_dir: Path):
     # data/employees.json they need to restart the dashboard — acceptable
     # for a local tool and simpler than hot-reloading.
     registry = EmployeeRegistry(data_dir)
+    # RetrievalIndex does non-trivial work on construction (loads embedding
+    # weights). Build once per process rather than per /api/query request.
+    retrieval = RetrievalIndex(data_dir / "retrieval")
 
     here = Path(__file__).resolve().parent
     templates = Jinja2Templates(directory=str(here / "templates"))
+
+    # Cache-busting version tag for static assets. The dashboard iterates
+    # the frontend heavily during development — without this, a user who
+    # `token-roi dashboard`s after a code update keeps the old JS in
+    # browser cache and sees stale behaviour (e.g. generic "Opus 4"
+    # badges) while the backend already ships the corrected data. We
+    # compute a hash of every file under static/ at startup; if any
+    # changed since the last dashboard run, the <script> URLs carry a
+    # new ?v=… and the browser re-fetches automatically.
+    import hashlib as _hashlib
+    _asset_hash = _hashlib.sha256()
+    for _p in sorted((here / "static").glob("**/*")):
+        if _p.is_file():
+            _asset_hash.update(_p.name.encode())
+            _asset_hash.update(_p.read_bytes())
+    asset_version = _asset_hash.hexdigest()[:12]
 
     app = FastAPI(title="bossify-with-claude")
     app.mount("/static", StaticFiles(directory=str(here / "static")), name="static")
@@ -96,6 +135,7 @@ def make_app(data_dir: Path):
                 "session_count": len(sessions),
                 "data_dir": str(data_dir),
                 "locale":    get_locale(),
+                "asset_version": asset_version,
             },
         )
 
@@ -108,6 +148,7 @@ def make_app(data_dir: Path):
     @app.get("/api/sessions")
     def api_sessions():
         names = db.session_names()
+        cost_map = db.session_cost_map()
         out = []
         for sid in db.all_sessions():
             t = db.session_totals(sid)
@@ -115,23 +156,30 @@ def make_app(data_dir: Path):
                 continue
             row = db.get_roi_score("session", sid)
             name_info = names.get(sid, {})
+            cost_usd = cost_map.get(sid, 0.0)
             out.append({
-                "session_id": sid,
-                "name":       name_info.get("name"),
-                "summary":    name_info.get("summary"),
-                "event_count": t.event_count,
-                "prompts": t.prompt_count,
-                "tools": t.tool_call_count,
-                "tokens_in": t.tokens_in,
-                "tokens_out": t.tokens_out,
+                "session_id":    sid,
+                "name":          name_info.get("name"),
+                "summary":       name_info.get("summary"),
+                "event_count":   t.event_count,
+                "prompts":       t.prompt_count,
+                "tools":         t.tool_call_count,
+                "tokens_in":     t.tokens_in,
+                "tokens_out":    t.tokens_out,
                 "cached_tokens": t.cached_tokens,
                 "memory_writes": t.memory_writes,
-                "retrievals": t.retrievals,
-                "total_tokens": t.total_tokens,
-                "roi_class": row["class"] if row else None,
-                "roi_score": row["score"] if row else None,
+                "retrievals":    t.retrievals,
+                "total_tokens":  t.total_tokens,
+                # Per-model priced USD — matches the Overview KPI and the
+                # Projects-tab cards. Added alongside the legacy token
+                # field so older clients don't break.
+                "cost_usd":       cost_usd,
+                "formatted_cost": format_currency(cost_usd),
+                "roi_class":     row["class"] if row else None,
+                "roi_score":     row["score"] if row else None,
             })
-        out.sort(key=lambda r: r["total_tokens"], reverse=True)
+        # Rank by USD (boss-view default) rather than raw token count.
+        out.sort(key=lambda r: r["cost_usd"], reverse=True)
         return out
 
     @app.get("/api/sessions/{session_id}")
@@ -153,49 +201,78 @@ def make_app(data_dir: Path):
         session_roi = db.get_roi_score("session", session_id)
         session_derivation = None
         if session_roi is not None:
-            try:
-                session_derivation = json.loads(session_roi["derivation_json"])
-            except Exception:
-                session_derivation = None
+            session_derivation = _safe_json_loads(session_roi["derivation_json"], None)
 
+        # Aggregate per-prompt token usage from the assistant_message events
+        # listed in attributions.cost_event_ids_json. Tokens live on the
+        # downstream assistant turn(s), not on the user_prompt event itself,
+        # so we sum across the JSON array of contributing event ids.
         prompts = db._conn.execute(
             """
+            WITH prompt_tokens AS (
+                SELECT
+                    a.prompt_event_id,
+                    SUM(COALESCE(e2.tokens_in, 0))             AS tokens_in,
+                    SUM(COALESCE(e2.tokens_out, 0))            AS tokens_out,
+                    SUM(COALESCE(e2.cached_tokens, 0))         AS cached_tokens,
+                    SUM(COALESCE(e2.cache_creation_tokens, 0)) AS cache_creation_tokens,
+                    MAX(e2.model)                              AS prompt_model
+                FROM attributions a, json_each(a.cost_event_ids_json) je
+                LEFT JOIN events e2 ON e2.id = je.value
+                WHERE a.session_id = ?
+                GROUP BY a.prompt_event_id
+            )
             SELECT a.prompt_event_id, a.cost_tokens, a.durable_bytes,
                    a.file_write_bytes, a.tool_calls, a.tool_successes,
                    a.retrieval_count, a.outcome_score, a.reuse_score,
                    e.payload_json, e.ts,
+                   pt.tokens_in, pt.tokens_out, pt.cached_tokens,
+                   pt.cache_creation_tokens, pt.prompt_model,
                    r.class, r.score, r.derivation_json,
                    j.meaningful_value, j.code_quality, j.output_durability,
                    j.efficiency, j.aggregate, j.reasoning, j.wasteful_patterns_json,
                    j.model AS judge_model
             FROM attributions a
-            LEFT JOIN events         e ON e.id = a.prompt_event_id
-            LEFT JOIN roi_scores     r ON r.scope_kind = 'prompt' AND r.scope_id = a.prompt_event_id
-            LEFT JOIN llm_judgments  j ON j.prompt_event_id = a.prompt_event_id
+            LEFT JOIN events         e  ON e.id = a.prompt_event_id
+            LEFT JOIN prompt_tokens  pt ON pt.prompt_event_id = a.prompt_event_id
+            LEFT JOIN roi_scores     r  ON r.scope_kind = 'prompt' AND r.scope_id = a.prompt_event_id
+            LEFT JOIN llm_judgments  j  ON j.prompt_event_id = a.prompt_event_id
             WHERE a.session_id = ?
             ORDER BY a.cost_tokens DESC
             """,
-            (session_id,),
+            (session_id, session_id),
         ).fetchall()
+
+        # Cap full prompt text at 50KB so a pathological paste (e.g. a
+        # giant code dump) can't bloat the modal payload past usable size.
+        TEXT_CAP = 50_000
 
         prompt_items = []
         for r in prompts:
-            text = json.loads(r["payload_json"]).get("text", "") if r["payload_json"] else ""
+            payload = _safe_json_loads(r["payload_json"], {})
+            text = payload.get("text", "") if isinstance(payload, dict) else ""
+            full_len = len(text)
             prompt_items.append({
-                "id":                 r["prompt_event_id"],
-                "text":               text[:600],
-                "text_full_length":   len(text),
-                "ts":                 r["ts"],
-                "cost_tokens":        r["cost_tokens"],
-                "durable_bytes":      r["durable_bytes"],
-                "file_write_bytes":   r["file_write_bytes"] or 0,
-                "tool_calls":         r["tool_calls"] or 0,
-                "tool_successes":     r["tool_successes"] or 0,
-                "retrieval_count":    r["retrieval_count"],
-                "outcome_score":      r["outcome_score"],
-                "reuse_score":        r["reuse_score"],
-                "class":              r["class"],
-                "score":              r["score"],
+                "id":                    r["prompt_event_id"],
+                "text":                  text[:TEXT_CAP],
+                "text_full_length":      full_len,
+                "text_truncated":        full_len > TEXT_CAP,
+                "ts":                    r["ts"],
+                "cost_tokens":           r["cost_tokens"],
+                "tokens_in":             int(r["tokens_in"] or 0),
+                "tokens_out":            int(r["tokens_out"] or 0),
+                "cached_tokens":         int(r["cached_tokens"] or 0),
+                "cache_creation_tokens": int(r["cache_creation_tokens"] or 0),
+                "model":                 r["prompt_model"],
+                "durable_bytes":         r["durable_bytes"],
+                "file_write_bytes":      r["file_write_bytes"] or 0,
+                "tool_calls":            r["tool_calls"] or 0,
+                "tool_successes":        r["tool_successes"] or 0,
+                "retrieval_count":       r["retrieval_count"],
+                "outcome_score":         r["outcome_score"],
+                "reuse_score":           r["reuse_score"],
+                "class":                 r["class"],
+                "score":                 r["score"],
                 "llm": ({
                     "meaningful_value":  r["meaningful_value"],
                     "code_quality":      r["code_quality"],
@@ -203,10 +280,7 @@ def make_app(data_dir: Path):
                     "efficiency":        r["efficiency"],
                     "aggregate":         r["aggregate"],
                     "reasoning":         r["reasoning"],
-                    "wasteful_patterns": (
-                        json.loads(r["wasteful_patterns_json"])
-                        if r["wasteful_patterns_json"] else []
-                    ),
+                    "wasteful_patterns": _safe_json_loads(r["wasteful_patterns_json"], []),
                     "model":             r["judge_model"],
                 } if r["meaningful_value"] is not None else None),
             })
@@ -238,6 +312,31 @@ def make_app(data_dir: Path):
             (session_id,),
         ).fetchall()
 
+        # Per-model cost split for this session. Answers "which model
+        # burned the tokens?" — a session that ran 90% Opus costs 5x
+        # what the same work on Sonnet would have. We also expose the
+        # per-category USD math (tokens × rate = subtotal) so the modal
+        # can reveal *how* the dollar figure was arrived at — otherwise
+        # "$143.01" is opaque and the boss can't sanity-check it.
+        from ..pricing import lookup_pricing
+        models = db.model_breakdown(session_ids=[session_id])
+        for m in models:
+            m["formatted_cost"] = format_currency(m["cost_usd"])
+            p = lookup_pricing(m["model"])
+            m["pricing"] = {
+                "input_per_m":      p.input_per_m,
+                "output_per_m":     p.output_per_m,
+                "cache_read_per_m": p.cache_read_per_m,
+                "cache_write_per_m": p.cache_write_per_m,
+            }
+            m["cost_components"] = {
+                "input_usd":        m["tokens_in"]    * p.input_per_m       / 1_000_000,
+                "output_usd":       m["tokens_out"]   * p.output_per_m      / 1_000_000,
+                "cache_read_usd":   m["cache_read"]   * p.cache_read_per_m  / 1_000_000,
+                "cache_create_usd": m["cache_create"] * p.cache_write_per_m / 1_000_000,
+            }
+        session_cost_usd = sum(m["cost_usd"] for m in models)
+
         return {
             "session_id": session_id,
             "name":       summary_info.get("name"),
@@ -245,6 +344,9 @@ def make_app(data_dir: Path):
             "roi_class":  session_roi["class"] if session_roi else None,
             "roi_score":  session_roi["score"] if session_roi else None,
             "roi_derivation": session_derivation,
+            "cost_usd":   session_cost_usd,
+            "formatted_cost": format_currency(session_cost_usd),
+            "model_breakdown": models,
             "totals": {
                 "event_count":   t.event_count,
                 "prompts":       t.prompt_count,
@@ -308,35 +410,60 @@ def make_app(data_dir: Path):
 
     @app.get("/api/top-spenders")
     def api_top_spenders():
+        """Biggest-spending prompts with USD cost alongside tokens.
+
+        The boss KPI is money, not tokens — we attach the per-model
+        priced USD cost so each row in the leaderboard reads as a
+        dollar amount first.
+        """
         rows = db.run_view("top_spenders.sql")
         names = db.session_names()
-        return [
-            {
+        cost_map = db.session_cost_map()
+        # Token→USD conversion at the prompt level uses the prompt's
+        # share of its session's cost, weighted by cost_tokens. This
+        # avoids running a separate per-prompt per-model aggregate
+        # query for every leaderboard render.
+        session_token_totals: dict[str, int] = {}
+        for r in rows:
+            session_token_totals[r["session_id"]] = (
+                session_token_totals.get(r["session_id"], 0) + (r["cost_tokens"] or 0)
+            )
+        out = []
+        for r in rows:
+            sid = r["session_id"]
+            sess_total = session_token_totals.get(sid, 0) or 1
+            share = (r["cost_tokens"] or 0) / sess_total
+            cost_usd = cost_map.get(sid, 0.0) * share
+            out.append({
                 "prompt_id": r["prompt_id"],
-                "session_id": r["session_id"],
-                "session_name": names.get(r["session_id"], {}).get("name"),
-                "text": json.loads(r["prompt_payload"] or "{}").get("text", "")[:280],
+                "session_id": sid,
+                "session_name": names.get(sid, {}).get("name"),
+                "text": (_safe_json_loads(r["prompt_payload"], {}) or {}).get("text", "")[:280],
                 "cost_tokens": r["cost_tokens"],
+                "cost_usd": cost_usd,
+                "formatted_cost": format_currency(cost_usd),
                 "class": r["class"],
                 "score": r["score"],
-            }
-            for r in rows
-        ]
+            })
+        return out
 
     @app.get("/api/black-holes")
     def api_black_holes():
-        """Sessions actually classified LOW_VALUE or WASTED, ranked by cost.
+        """Sessions classified LOW_VALUE or WASTED, with their USD bill.
 
-        The view already filters by roi_scores.class, so a session that
-        scored HIGH_VALUE or TRANSIENT won't appear here even if its
-        raw cost is high — by definition such a session is not a
-        black hole.
+        USD cost is computed per-model by ``AnalyticsDB.session_cost_map``,
+        so a session that mixes Opus and Sonnet is priced correctly rather
+        than blended against a single rate.
         """
         rows = db.run_view("black_holes.sql")
         names = db.session_names()
+        cost_map = db.session_cost_map()
         out = []
         for r in rows:
             d = dict(r)
+            cost = cost_map.get(d.get("session_id"), 0.0)
+            d["cost_usd"] = cost
+            d["formatted_cost"] = format_currency(cost)
             d["name"] = names.get(d.get("session_id"), {}).get("name")
             out.append(d)
         return out
@@ -349,47 +476,20 @@ def make_app(data_dir: Path):
                 "path": r["path"],
                 "kind": r["kind"],
                 "ts": r["ts"],
-                "bytes": json.loads(r["payload_json"]).get("bytes", 0),
+                "bytes": (_safe_json_loads(r["payload_json"], {}) or {}).get("bytes", 0),
             }
             for r in rows
         ]
 
     @app.get("/api/kpis")
     def api_kpis():
-        """Single-shot fetch of the hero-row KPIs."""
-        row = db._conn.execute(
-            """
-            SELECT
-                COUNT(DISTINCT session_id)  AS sessions,
-                COUNT(*)                    AS events,
-                SUM(tokens_in)              AS tokens_in,
-                SUM(tokens_out)             AS tokens_out,
-                SUM(cached_tokens)          AS cache_read,
-                SUM(cache_creation_tokens)  AS cache_create,
-                SUM(total_tokens)           AS total_tokens,
-                SUM(type = 'memory_write')  AS memory_writes,
-                SUM(type = 'retrieval_query') AS retrievals,
-                SUM(type = 'post_tool_use') AS tool_calls
-            FROM events
-            """
-        ).fetchone()
-        roi = db.roi_summary()
-        return {
-            "sessions":      row["sessions"] or 0,
-            "events":        row["events"] or 0,
-            "tokens_in":     row["tokens_in"] or 0,
-            "tokens_out":    row["tokens_out"] or 0,
-            "cache_read":    row["cache_read"] or 0,
-            "cache_create":  row["cache_create"] or 0,
-            "total_tokens":  row["total_tokens"] or 0,
-            "memory_writes": row["memory_writes"] or 0,
-            "retrievals":    row["retrievals"] or 0,
-            "tool_calls":    row["tool_calls"] or 0,
-            "high_value":    roi.get("HIGH_VALUE", 0),
-            "transient":     roi.get("TRANSIENT_VALUE", 0),
-            "low_value":     roi.get("LOW_VALUE", 0),
-            "wasted":        roi.get("WASTED", 0),
-        }
+        """Hero-row KPIs incl. per-model USD cost and audit-gap counter."""
+        k = db.kpis()
+        k["formatted_cost"] = format_currency(k["total_cost_usd"])
+        # Surface malformed-event count so audit-trail gaps are visible
+        # rather than buried in stderr.
+        k["malformed_events_skipped"] = store.malformed_events_skipped
+        return k
 
     @app.get("/api/cost-breakdown")
     def api_cost_breakdown():
@@ -541,11 +641,9 @@ def make_app(data_dir: Path):
         names = db.session_names()
         out = []
         for r in rows:
-            text = json.loads(r["payload_json"] or "{}").get("text", "")
-            try:
-                patterns = json.loads(r["wasteful_patterns_json"] or "[]")
-            except Exception:
-                patterns = []
+            payload = _safe_json_loads(r["payload_json"], {}) or {}
+            text = payload.get("text", "") if isinstance(payload, dict) else ""
+            patterns = _safe_json_loads(r["wasteful_patterns_json"], [])
             out.append({
                 "prompt_id":         r["prompt_event_id"],
                 "session_id":        r["session_id"],
@@ -578,13 +676,18 @@ def make_app(data_dir: Path):
         """Top-line team rollup for the manager landing page.
 
         Bosses land here and want to know instantly: how many people are
-        using Claude, how much are they spending, is the spend producing
-        anything, and what are the most common patterns of waste.
+        using Claude, how much are they spending (in dollars, not
+        tokens — that's the actual business question), is the spend
+        producing anything, and what are the most common patterns of
+        waste. We compute USD per-model so a mixed Opus/Sonnet team is
+        priced correctly.
         """
         employees = db.employees_with_stats(registry)
         active = [e for e in employees if e["session_count"] > 0]
 
-        total_cost = sum(e["total_cost"] for e in active)
+        total_cost_tokens = sum(e["total_cost"] for e in active)
+        total_cost_usd = db.total_cost()
+
         # ROI totals across the entire team's sessions.
         roi_totals = {"HIGH_VALUE": 0, "TRANSIENT_VALUE": 0,
                       "LOW_VALUE": 0, "WASTED": 0, "UNSCORED": 0}
@@ -602,10 +705,26 @@ def make_app(data_dir: Path):
             + roi_totals.get("WASTED", 0)
         )
 
+        # Durable-output stat for the "cost per KB shipped" line.
+        file_bytes_row = db._conn.execute(
+            """SELECT COALESCE(SUM(json_extract(payload_json, '$.bytes')), 0) AS b
+                 FROM events WHERE type = 'file_write'"""
+        ).fetchone()
+        total_file_bytes = int(file_bytes_row["b"] or 0)
+        total_kb = total_file_bytes / 1024.0
+        cost_per_kb = (total_cost_usd / total_kb) if total_kb > 0 else None
+
         return {
             "active_employees":      len(active),
             "total_employees":       len(employees),
-            "total_cost":            total_cost,
+            "total_cost":            total_cost_tokens,       # tokens (legacy)
+            "total_cost_usd":        total_cost_usd,
+            "formatted_cost":        format_currency(total_cost_usd),
+            "total_file_bytes":      total_file_bytes,
+            "cost_per_kb":           cost_per_kb,
+            "formatted_cost_per_kb": (
+                format_currency(cost_per_kb) if cost_per_kb is not None else None
+            ),
             "avg_efficiency":        avg_eff,
             "high_value_sessions":   high_count,
             "waste_alerts":          waste_count,
@@ -621,13 +740,15 @@ def make_app(data_dir: Path):
     @app.get("/api/employees/{employee_id}")
     def api_employee(employee_id: str):
         """Deep-dive: one employee plus their full session list."""
+        # Compute once — this query is expensive (multi-way join).
+        all_stats = db.employees_with_stats(registry)
         emp = registry.get(employee_id)
         if emp is None:
             # Registry may not have the employee yet (edited config) —
             # still surface any sessions attributed to the id so nothing
             # vanishes silently.
             stats_row = next(
-                (e for e in db.employees_with_stats(registry) if e["id"] == employee_id),
+                (e for e in all_stats if e["id"] == employee_id),
                 None,
             )
             if stats_row is None:
@@ -635,7 +756,7 @@ def make_app(data_dir: Path):
             rollup = stats_row
         else:
             rollup = next(
-                (e for e in db.employees_with_stats(registry) if e["id"] == emp.id),
+                (e for e in all_stats if e["id"] == emp.id),
                 None,
             ) or {"id": emp.id, "name": emp.name, "role": emp.role, "team": emp.team,
                   "session_count": 0, "total_cost": 0, "file_write_bytes": 0,
@@ -648,10 +769,16 @@ def make_app(data_dir: Path):
         rollup["sessions"] = db.sessions_for_employee(rollup["id"], registry)
         return rollup
 
+    # Bounds on retrieval top_k. A value this small still covers every
+    # realistic UI and prevents ?top_k=1000000 from exhausting memory.
+    _MAX_TOP_K = 50
+
     @app.get("/api/query")
     def api_query(q: str, top_k: int = 5):
-        idx = RetrievalIndex(data_dir / "retrieval")
-        results = idx.query(q, top_k=top_k)
+        if not q or not q.strip():
+            raise HTTPException(400, "query string 'q' is required")
+        top_k = max(1, min(_MAX_TOP_K, top_k))
+        results = retrieval.query(q, top_k=top_k)
         return [
             {
                 "doc_id": r.doc_id, "kind": r.kind, "score": r.score,
@@ -660,5 +787,63 @@ def make_app(data_dir: Path):
             }
             for r in results
         ]
+
+    # ---- projects ----
+
+    @app.get("/api/projects")
+    def api_projects():
+        """Per-project rollup for the boss dashboard.
+
+        Each project corresponds to one Claude Code workspace. Returns
+        USD cost (per-model priced), session count, durable bytes
+        produced, ROI class distribution, model mix, and a cost-per-KB
+        productivity ratio so the boss can see "this project spent $X
+        on Opus vs Sonnet and produced Y KB of code" at a glance.
+        """
+        rows = db.projects_with_stats()
+        for r in rows:
+            r["formatted_cost"] = format_currency(r["cost_usd"])
+            if r.get("cost_per_kb") is not None:
+                r["formatted_cost_per_kb"] = format_currency(r["cost_per_kb"])
+            else:
+                r["formatted_cost_per_kb"] = None
+            # Per-model split so the card can show "Opus 85% · Sonnet 15%".
+            models = db.model_breakdown(project_slug=r["slug"])
+            for m in models:
+                m["formatted_cost"] = format_currency(m["cost_usd"])
+            r["model_breakdown"] = models
+        return rows
+
+    @app.get("/api/projects/{slug}")
+    def api_project(slug: str):
+        """Drill-down for one project: session list, cost, ROI mix, model mix."""
+        rollup = next(
+            (p for p in db.projects_with_stats() if p["slug"] == slug),
+            None,
+        )
+        if rollup is None:
+            raise HTTPException(404, f"no such project: {slug}")
+        rollup["formatted_cost"] = format_currency(rollup["cost_usd"])
+        rollup["formatted_cost_per_kb"] = (
+            format_currency(rollup["cost_per_kb"])
+            if rollup.get("cost_per_kb") is not None else None
+        )
+        sessions = db.sessions_for_project(slug)
+        for s in sessions:
+            s["formatted_cost"] = format_currency(s["cost_usd"])
+        rollup["sessions"] = sessions
+        models = db.model_breakdown(project_slug=slug)
+        for m in models:
+            m["formatted_cost"] = format_currency(m["cost_usd"])
+        rollup["model_breakdown"] = models
+        return rollup
+
+    @app.get("/api/model-breakdown")
+    def api_model_breakdown():
+        """Workspace-wide per-model cost split for the overview KPI row."""
+        models = db.model_breakdown()
+        for m in models:
+            m["formatted_cost"] = format_currency(m["cost_usd"])
+        return models
 
     return app

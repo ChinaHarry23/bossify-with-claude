@@ -199,6 +199,135 @@ html, body {
 .emp-card.rating-warn      { border-left-color: var(--wasted); }
 .emp-card.rating-unjudged  { border-left-color: var(--muted); }
 
+/* Projects grid — same layout primitives as the employees grid, but the
+   hero number on each card is USD (not a role line) and the left accent
+   always glows the accent colour since projects have no rating state. */
+.projects-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 14px;
+  padding: 20px;
+}
+.projects-grid .loading {
+  grid-column: 1 / -1;
+  text-align: center;
+  color: var(--muted);
+  font-family: var(--mono);
+  padding: 40px 0;
+}
+.proj-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  padding: 14px 16px;
+  display: flex; flex-direction: column;
+  gap: 12px;
+  cursor: pointer;
+  transition: border-color 120ms ease, transform 120ms ease;
+}
+.proj-card:hover { border-color: var(--accent); transform: translateY(-1px); }
+.proj-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 10px;
+}
+.proj-name {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--text);
+}
+.proj-sub {
+  color: var(--muted);
+  font-size: 11px;
+  margin-top: 2px;
+  line-height: 1.45;
+}
+.proj-cost {
+  font-family: var(--mono);
+  font-weight: 600;
+  font-size: 18px;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+/* Model-mix chip row. One pill per model family — the hero metric on a
+   boss-view card because it separates "we spent $400 on Opus" from
+   "we spent $400 on Haiku" in one glance. */
+.model-mix {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.model-chip {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.02);
+  white-space: nowrap;
+}
+
+/* Sort-pill toggle inside the section header. One pill per sort key;
+   the active one is highlighted via the same accent as the rest of
+   the dashboard so the choice is visible at a glance. */
+.sort-pills {
+  display: inline-flex;
+  gap: 4px;
+  margin-left: 8px;
+}
+.sort-pill {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: border-color 120ms ease, color 120ms ease, background 120ms ease;
+}
+.sort-pill:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+.sort-pill.active {
+  border-color: var(--accent);
+  background: rgba(100, 120, 255, 0.08);
+  color: var(--text);
+}
+
+/* Filter pill shown above the leaderboard when the user has clicked a
+   donut segment. Acts as both a status indicator ("you're seeing only
+   LOW_VALUE sessions") and the click target to clear the filter. */
+.filter-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  margin: 0 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(100, 120, 255, 0.08);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.filter-pill:hover {
+  border-color: var(--accent);
+  background: rgba(100, 120, 255, 0.14);
+}
+.filter-pill .clear-x {
+  margin-left: 2px;
+  font-size: 14px;
+  color: var(--muted);
+}
+.filter-pill:hover .clear-x {
+  color: var(--text);
+}
+
 .emp-head {
   display: flex; align-items: baseline; justify-content: space-between;
   gap: 10px;
@@ -650,6 +779,91 @@ html, body {
 .metric .value { font-size: 18px; font-weight: 700; margin-top: 3px;
                  font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
 
+.metric-clickable { cursor: pointer; transition: border-color 120ms ease, background 120ms ease; }
+.metric-clickable:hover  { border-color: var(--accent); }
+.metric-clickable:focus  { outline: none; border-color: var(--accent);
+                           box-shadow: 0 0 0 2px rgba(100,120,255,0.18); }
+.metric-clickable.expanded { border-color: var(--accent);
+                             background: rgba(100,120,255,0.04); }
+.metric .metric-chevron {
+  display: inline-block; margin-left: 4px;
+  transition: transform 160ms ease;
+}
+.metric-clickable:hover .metric-chevron,
+.metric-clickable.expanded .metric-chevron { color: var(--accent); }
+.metric-clickable.expanded .metric-chevron { transform: rotate(-180deg); }
+
+/* Inline panel revealed when TOTAL SPENT is clicked. Sits between the
+   metrics grid and the model-mix pill row so the dollar figure and its
+   derivation stay visually adjacent. */
+.cost-breakdown {
+  margin-top: 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  padding: 14px 16px;
+  display: flex; flex-direction: column; gap: 14px;
+}
+.cost-breakdown-h {
+  font-family: var(--mono); font-size: 11px; font-weight: 700;
+  letter-spacing: 0.06em; text-transform: uppercase;
+  display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap;
+}
+.cost-breakdown-h .muted { font-weight: 400; text-transform: none; letter-spacing: 0; }
+
+.cost-model-block { display: flex; flex-direction: column; gap: 6px; }
+.cost-model-head {
+  display: flex; justify-content: space-between; align-items: baseline;
+  font-family: var(--mono); font-size: 12px;
+  padding-bottom: 4px;
+  border-bottom: 1px dashed var(--line);
+}
+.cost-model-name  { color: var(--text); font-weight: 600; }
+.cost-model-total { color: var(--accent); font-weight: 700;
+                    font-variant-numeric: tabular-nums; }
+
+.cost-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono); font-size: 12px;
+}
+.cost-table th {
+  text-align: left;
+  color: var(--muted); font-weight: 500;
+  font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+}
+.cost-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+}
+.cost-table tbody tr:last-child td { border-bottom: none; }
+.cost-table .cb-cat   { color: var(--text); }
+.cost-table .cb-num   { text-align: right; font-variant-numeric: tabular-nums; }
+.cost-table .cb-rate  { color: var(--muted); }
+.cost-table .cb-sub   { color: var(--text); font-weight: 600; }
+.cost-table tfoot td  { padding-top: 8px; }
+.cost-table .cb-foot-label { color: var(--muted); text-align: right;
+                             font-size: 10px; letter-spacing: 0.08em;
+                             text-transform: uppercase; }
+.cost-table .cb-total { color: var(--accent); font-weight: 700; }
+
+.cost-grand-total {
+  display: flex; justify-content: space-between; align-items: center;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  font-family: var(--mono); font-size: 13px;
+  font-weight: 700;
+}
+.cost-grand-total .cb-total { font-size: 16px; }
+
+@media (max-width: 720px) {
+  .cost-table .cb-rate { display: none; }
+  .cost-table th:nth-child(3), .cost-table td:nth-child(3) { display: none; }
+}
+
 .section-h {
   font-family: var(--mono);
   font-size: 11px;
@@ -698,7 +912,12 @@ html, body {
   border-left: 3px solid var(--muted);
   border-radius: 4px;
   padding: 12px 14px;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
 }
+.prompt-item:hover  { border-color: var(--accent); }
+.prompt-item:focus  { outline: none; border-color: var(--accent);
+                      box-shadow: 0 0 0 2px rgba(100,120,255,0.18); }
 .prompt-item.cls-HIGH_VALUE      { border-left-color: var(--high); }
 .prompt-item.cls-TRANSIENT_VALUE { border-left-color: var(--transient); }
 .prompt-item.cls-LOW_VALUE       { border-left-color: var(--low); }
@@ -706,7 +925,7 @@ html, body {
 
 .prompt-item .prompt-head {
   display: grid;
-  grid-template-columns: auto auto 1fr;
+  grid-template-columns: auto 1fr auto;
   gap: 10px;
   align-items: center;
   margin-bottom: 8px;
@@ -720,6 +939,14 @@ html, body {
 .prompt-item .prompt-cost {
   font-family: var(--mono); font-size: 11px; color: var(--muted);
 }
+.prompt-item .prompt-chevron {
+  font-family: var(--mono); font-size: 12px; color: var(--muted);
+  transition: transform 160ms ease, color 120ms ease;
+  user-select: none;
+}
+.prompt-item:hover .prompt-chevron { color: var(--accent); }
+.prompt-item.expanded .prompt-chevron { transform: rotate(-180deg); color: var(--accent); }
+
 .prompt-item .prompt-text {
   font-family: var(--sans); font-size: 12.5px;
   color: var(--text); white-space: pre-wrap;
@@ -730,6 +957,70 @@ html, body {
   content: ""; position: absolute; inset: auto 0 0 0; height: 2em;
   background: linear-gradient(to top, var(--panel), transparent);
   pointer-events: none;
+}
+/* When expanded, hide the preview to avoid duplicating the full text below. */
+.prompt-item.expanded .prompt-text { display: none; }
+
+/* Detail pane revealed on click. Cursor goes back to default so the
+   user knows the inner content is selectable, not another toggle. */
+.prompt-item .prompt-detail {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--line);
+  display: flex; flex-direction: column; gap: 14px;
+  cursor: default;
+}
+.prompt-item .prompt-detail-h {
+  font-family: var(--mono); font-size: 10px; font-weight: 700;
+  letter-spacing: 0.08em; color: var(--muted);
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
+.prompt-item .prompt-text-full {
+  font-family: var(--mono); font-size: 12px;
+  color: var(--text); white-space: pre-wrap; word-break: break-word;
+  margin: 0; padding: 10px 12px;
+  background: var(--bg-2); border: 1px solid var(--line); border-radius: 3px;
+  max-height: 50vh; overflow-y: auto;
+  line-height: 1.5;
+}
+.prompt-item .prompt-trunc-note {
+  margin-top: 6px;
+  font-family: var(--mono); font-size: 11px;
+}
+.prompt-item .token-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 8px;
+}
+.prompt-item .token-cell {
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 8px 10px;
+}
+.prompt-item .token-cell-total {
+  border-color: var(--accent);
+  background: rgba(100, 120, 255, 0.06);
+}
+.prompt-item .token-label {
+  font-family: var(--mono); font-size: 10px;
+  color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em;
+  margin-bottom: 4px;
+}
+.prompt-item .token-value {
+  font-family: var(--mono); font-size: 14px; font-weight: 600;
+  color: var(--text);
+}
+.prompt-item .prompt-detail-meta {
+  display: flex; flex-wrap: wrap; gap: 16px;
+  font-family: var(--mono); font-size: 11px; color: var(--muted);
+  margin-top: 4px;
+}
+.prompt-item .prompt-detail-meta b { color: var(--text); font-weight: 600; }
+
+@media (max-width: 720px) {
+  .prompt-item .token-grid { grid-template-columns: repeat(2, 1fr); }
 }
 .prompt-item .metrics-inline {
   display: flex; flex-wrap: wrap; gap: 10px;

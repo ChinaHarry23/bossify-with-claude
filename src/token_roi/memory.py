@@ -202,7 +202,7 @@ class MemoryLayer:
         if self._store and session_id:
             self._store.append(make_event(
                 session_id=session_id,
-                seq=self._store._next_seq(session_id),
+                seq=self._store.next_seq(session_id),
                 type=EventType.MEMORY_DELETE,
                 payload={"path": str(path)},
             ))
@@ -221,7 +221,7 @@ class MemoryLayer:
             return
         self._store.append(make_event(
             session_id=session_id,
-            seq=self._store._next_seq(session_id),
+            seq=self._store.next_seq(session_id),
             type=EventType.MEMORY_READ,
             payload={
                 "path": str(path),
@@ -235,7 +235,7 @@ class MemoryLayer:
             return
         self._store.append(make_event(
             session_id=session_id,
-            seq=self._store._next_seq(session_id),
+            seq=self._store.next_seq(session_id),
             type=EventType.MEMORY_WRITE,
             payload={
                 "path": str(path),

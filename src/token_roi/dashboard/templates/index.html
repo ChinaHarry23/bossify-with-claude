@@ -4,8 +4,8 @@
 <meta charset="utf-8" />
 <title data-i18n="brand.name">Bossify with Claude</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<link rel="stylesheet" href="/static/app.css" />
-<script src="/static/echarts.min.js"></script>
+<link rel="stylesheet" href="/static/app.css?v={{ asset_version }}" />
+<script src="/static/echarts.min.js?v={{ asset_version }}"></script>
 </head>
 <body>
 <header class="topbar">
@@ -32,9 +32,10 @@
 </header>
 
 <nav class="tabs" id="tabs">
-  <button class="tab active" data-tab="team"      data-i18n="tab.team">Team Overview</button>
-  <button class="tab"        data-tab="employees" data-i18n="tab.employees">Employees</button>
-  <button class="tab"        data-tab="advanced"  data-i18n="tab.advanced">Advanced</button>
+  <button class="tab active" data-tab="team"      data-i18n="tab.team">Overview</button>
+  <button class="tab"        data-tab="employees" data-i18n="tab.employees">People</button>
+  <button class="tab"        data-tab="projects"  data-i18n="tab.projects">Projects</button>
+  <button class="tab"        data-tab="advanced"  data-i18n="tab.advanced">Technical detail</button>
 </nav>
 
 <!-- ============================================================ -->
@@ -43,28 +44,33 @@
 <main id="view-team" class="view active">
   <section class="kpis team-kpis">
     <div class="kpi">
-      <div class="kpi-label" data-i18n="team.active_employees">active employees</div>
+      <div class="kpi-label" data-i18n="team.active_employees">people using AI</div>
       <div class="kpi-value" id="team-kpi-employees">—</div>
     </div>
     <div class="kpi">
-      <div class="kpi-label" data-i18n="team.total_spend">team token spend</div>
+      <div class="kpi-label" data-i18n="team.total_spend">total spent</div>
       <div class="kpi-value" id="team-kpi-cost">—</div>
-      <div class="kpi-sub" data-i18n="team.total_spend_sub">effective cost</div>
+      <div class="kpi-sub" data-i18n="team.total_spend_sub">estimated USD</div>
     </div>
     <div class="kpi">
-      <div class="kpi-label" data-i18n="team.avg_efficiency">avg efficiency</div>
+      <div class="kpi-label" data-i18n="team.cost_per_kb">cost per KB of code</div>
+      <div class="kpi-value" id="team-kpi-ppk">—</div>
+      <div class="kpi-sub" data-i18n="team.cost_per_kb_sub">USD ÷ bytes produced</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label" data-i18n="team.avg_efficiency">efficiency</div>
       <div class="kpi-value" id="team-kpi-eff">—</div>
-      <div class="kpi-sub" data-i18n="team.avg_efficiency_sub">LLM-judged, 0 to 1</div>
+      <div class="kpi-sub" data-i18n="team.avg_efficiency_sub">0 = wasteful, 1 = lean</div>
     </div>
     <div class="kpi roi-high">
-      <div class="kpi-label" data-i18n="team.high_value_sessions">high-value sessions</div>
+      <div class="kpi-label" data-i18n="team.high_value_sessions">great sessions</div>
       <div class="kpi-value" id="team-kpi-high">—</div>
-      <div class="kpi-sub" data-i18n="team.high_value_sessions_sub">LLM ≥ 0.85</div>
+      <div class="kpi-sub" data-i18n="team.high_value_sessions_sub">worth the spend</div>
     </div>
     <div class="kpi roi-wasted">
-      <div class="kpi-label" data-i18n="team.waste_alerts">waste alerts</div>
+      <div class="kpi-label" data-i18n="team.waste_alerts">problem sessions</div>
       <div class="kpi-value" id="team-kpi-waste">—</div>
-      <div class="kpi-sub" data-i18n="team.waste_alerts_sub">LOW_VALUE + WASTED</div>
+      <div class="kpi-sub" data-i18n="team.waste_alerts_sub">burnt money</div>
     </div>
   </section>
 
@@ -92,6 +98,15 @@
 <!-- ============================================================ -->
 <main id="view-employees" class="view">
   <section class="employees-grid" id="employees-grid">
+    <div class="loading" data-i18n="common.loading">Loading</div>
+  </section>
+</main>
+
+<!-- ============================================================ -->
+<!-- PROJECTS                                                     -->
+<!-- ============================================================ -->
+<main id="view-projects" class="view">
+  <section class="projects-grid" id="projects-grid">
     <div class="loading" data-i18n="common.loading">Loading</div>
   </section>
 </main>
@@ -191,8 +206,7 @@
         <span data-i18n="card.query">Hybrid query</span>
         <form id="query-form" class="inline-form">
           <input name="q" type="text" autocomplete="off"
-                 data-i18n-placeholder="form.query_placeholder"
-                 placeholder="auth middleware rewrite" />
+                 data-i18n-placeholder="form.query_placeholder_default" />
           <button type="submit" data-i18n="form.query_button">query</button>
         </form>
       </div>
@@ -210,7 +224,7 @@
         <div class="modal-subtitle" id="modal-subtitle">—</div>
       </div>
       <div class="modal-class" id="modal-class">—</div>
-      <button class="modal-close" aria-label="close" data-close>×</button>
+      <button class="modal-close" data-i18n-aria-label="aria.close" data-close>×</button>
     </header>
     <div class="modal-body" id="modal-body" data-i18n="common.loading">loading…</div>
     <footer class="modal-foot">
@@ -219,7 +233,7 @@
   </div>
 </div>
 
-<script src="/static/app.js"></script>
-<script src="/static/app.manager.js"></script>
+<script src="/static/app.js?v={{ asset_version }}"></script>
+<script src="/static/app.manager.js?v={{ asset_version }}"></script>
 </body>
 </html>

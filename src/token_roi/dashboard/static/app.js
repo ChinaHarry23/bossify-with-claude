@@ -55,6 +55,10 @@ async function loadI18n() {
     const key = el.getAttribute("data-i18n-title");
     if (key) el.setAttribute("title", T(key));
   });
+  document.querySelectorAll("[data-i18n-aria-label]").forEach((el) => {
+    const key = el.getAttribute("data-i18n-aria-label");
+    if (key) el.setAttribute("aria-label", T(key));
+  });
 }
 
 const THEME = {
@@ -141,6 +145,11 @@ async function loadKpis() {
   $("#kpi-transient").textContent = fmt(k.transient);
   $("#kpi-low").textContent       = fmt(k.low_value);
   $("#kpi-wasted").textContent    = fmt(k.wasted);
+
+  // Boss view: Update the total cost KPI with USD
+  if ($("#team-kpi-cost")) {
+    $("#team-kpi-cost").textContent = k.formatted_cost || "—";
+  }
 
   $("#last-updated").textContent =
     T("brand.last_refreshed") + " " + new Date().toLocaleTimeString();
@@ -359,7 +368,7 @@ async function loadMemoryScatterChart() {
   mount("chart-memory-scatter", {
     tooltip: {
       ...baseTooltip, trigger: "item",
-      formatter: (p) => `<b>${p.seriesName}</b><br/>${p.name}<br/>${fmt(p.value[0])} bytes · ${fmt(p.value[1])} hits`,
+      formatter: (p) => `<b>${p.seriesName}</b><br/>${p.name}<br/>${fmt(p.value[0])} ${T("chart.tooltip.bytes")} · ${fmt(p.value[1])} ${T("chart.tooltip.hits")}`,
     },
     legend: { textStyle: { color: THEME.muted, fontFamily: baseTextStyle.fontFamily, fontSize: 10 }, top: 0 },
     grid: { ...baseGrid, top: 30 },
@@ -396,7 +405,7 @@ async function loadToolsChart() {
   mount("chart-tools", {
     tooltip: {
       ...baseTooltip,
-      formatter: (p) => `<b>${p.name}</b><br/>${fmt(p.value)} calls · ${fmt(p.data.errors)} errors`,
+      formatter: (p) => `<b>${p.name}</b><br/>${fmt(p.value)} ${T("chart.tooltip.calls")} · ${fmt(p.data.errors)} ${T("chart.tooltip.errors")}`,
     },
     series: [{
       type: "treemap",
@@ -447,7 +456,7 @@ async function loadBlackHolesChart() {
         const score = r.roi_score != null ? ` · ${T("chart.score_label")} ${Number(r.roi_score).toFixed(3)}` : "";
         return `${head}<br/>
                 ${T("chart.class_label")}: <b class="cls-${cls}">${clsLabel}</b>${score}<br/>
-                ${T("llm.cost")}: ${fmt(r.total_cost)}<br/>
+                ${T("llm.cost")}: ${r.formatted_cost || fmt(r.total_cost)}<br/>
                 ${T("modal.prompt.file_writes")}: ${fmt(r.total_file_writes || 0)} ${T("unit.bytes")}<br/>
                 ${T("modal.metric.memory_writes")}: ${fmt(r.total_durable)}<br/>
                 ${T("chart.retrieval_hits")}: ${fmt(r.total_reuse)}`;
@@ -506,7 +515,10 @@ async function loadLlmJudgments() {
   const models = [...new Set(rows.map((r) => r.model))];
   $("#llm-model").textContent = T("llm.judgments_meta", {
     n:          rows.length,
-    s:          models.length > 1 ? "s" : "",
+    // Pluralization marker — English wants "s" for >1, Chinese drops it.
+    // Locales that don't need it either omit the {s} placeholder in
+    // their catalog entry (zh) or interpolate nothing here.
+    s:          (I18N.locale === "en" && models.length > 1) ? "s" : "",
     models:     models.join(", "),
     meaningful: (summary.avg_meaningful || 0).toFixed(2),
     durability: (summary.avg_durability || 0).toFixed(2),
@@ -642,12 +654,12 @@ function buildWhyHtml(detail) {
 
   // Always surface the raw math at the bottom so everything remains auditable.
   const mathRow = `<div style="margin-top:10px;font-family:var(--mono);font-size:11px;color:var(--muted)">
-      numerator = ${(num.v_durable || 0).toFixed(2)}·w_durable
-               + ${(num.v_reuse || 0).toFixed(2)}·w_reuse
-               + ${(num.v_outcome || 0).toFixed(2)}·w_outcome
-               + ${(num.v_llm || 0).toFixed(2)}·w_llm
-      &nbsp;/&nbsp; denominator = ${(den.cost_unit || 0).toFixed(2)} cost_unit + ${(den.v_negative || 0).toFixed(2)} penalty
-      &nbsp;=&nbsp; <b style="color:var(--text)">score ${(detail.roi_score || 0).toFixed(3)}</b>
+      ${T("derivation.numerator")} = ${(num.v_durable || 0).toFixed(2)}·${T("derivation.w_durable")}
+               + ${(num.v_reuse || 0).toFixed(2)}·${T("derivation.w_reuse")}
+               + ${(num.v_outcome || 0).toFixed(2)}·${T("derivation.w_outcome")}
+               + ${(num.v_llm || 0).toFixed(2)}·${T("derivation.w_llm")}
+      &nbsp;/&nbsp; ${T("derivation.denominator")} = ${(den.cost_unit || 0).toFixed(2)} ${T("derivation.cost_unit")} + ${(den.v_negative || 0).toFixed(2)} ${T("derivation.penalty")}
+      &nbsp;=&nbsp; <b style="color:var(--text)">${T("derivation.score")} ${(detail.roi_score || 0).toFixed(3)}</b>
     </div>`;
 
   const bulletHtml = bullets.length
@@ -683,7 +695,10 @@ function buildWhyHtml(detail) {
 
 function buildMetricsHtml(detail) {
   const t = detail.totals || {};
+  // Lead with USD — it's the boss's headline number. Token sub-metrics
+  // follow for the technical reader.
   const cells = [
+    [T("team.total_spend"),           detail.formatted_cost || "—", "cost"],
     [T("modal.metric.tokens_out"),    fmtCompact(t.tokens_out)],
     [T("modal.metric.cache_read"),    fmtCompact(t.cache_read)],
     [T("modal.metric.cache_create"),  fmtCompact(t.cache_create)],
@@ -691,10 +706,123 @@ function buildMetricsHtml(detail) {
     [T("modal.metric.tool_calls"),    fmt(t.tools)],
     [T("modal.metric.memory_writes"), fmt(t.memory_writes)],
   ];
+  const mix = (typeof renderModelMix === "function")
+    ? renderModelMix(detail.model_breakdown || [])
+    : "";
   return `<div><div class="section-h">${T("modal.section.totals")}</div>
-    <div class="metrics">${cells.map(([l, v]) => `
-      <div class="metric"><div class="label">${l}</div><div class="value">${v}</div></div>
-    `).join("")}</div>
+    <div class="metrics">${cells.map(([l, v, kind]) => {
+      if (kind === "cost") {
+        return `<div class="metric metric-clickable" tabindex="0" role="button"
+                  aria-expanded="false" data-cost-toggle
+                  title="${escapeHtml(T("modal.cost.click_hint"))}">
+          <div class="label">${l} <span class="metric-chevron" aria-hidden="true">▾</span></div>
+          <div class="value">${v}</div>
+        </div>`;
+      }
+      return `<div class="metric"><div class="label">${l}</div><div class="value">${v}</div></div>`;
+    }).join("")}</div>
+    ${buildCostBreakdownHtml(detail)}
+    ${mix ? `<div class="section-h" style="margin-top:12px">${T("projects.model_mix")}</div>${mix}` : ""}
+  </div>`;
+}
+
+// Hidden-by-default panel revealed when the user clicks the TOTAL SPENT
+// tile. Shows the per-model, per-category math (tokens × rate = USD)
+// that produced detail.formatted_cost. Lives inline after the metrics
+// grid so the dollar figure and its derivation stay visually adjacent.
+function buildCostBreakdownHtml(detail) {
+  const models = Array.isArray(detail.model_breakdown) ? detail.model_breakdown : [];
+  if (!models.length) {
+    return `<div class="cost-breakdown" hidden>
+      <div class="muted">${escapeHtml(T("modal.cost.no_billed"))}</div>
+    </div>`;
+  }
+  const usd2 = (n) => "$" + (Number(n) || 0).toFixed(2);
+  const usd4 = (n) => "$" + (Number(n) || 0).toFixed(4);
+  const rate = (n) => "$" + Number(n).toFixed(2);
+
+  const rowFor = (label, tokens, ratePerM, subUsd) => `
+    <tr>
+      <td class="cb-cat">${escapeHtml(label)}</td>
+      <td class="cb-num">${fmt(tokens)}</td>
+      <td class="cb-num cb-rate">${rate(ratePerM)} / 1M</td>
+      <td class="cb-num cb-sub">${usd4(subUsd)}</td>
+    </tr>`;
+
+  const blocks = models.map((m) => {
+    const p = m.pricing || {};
+    const c = m.cost_components || {};
+    return `<div class="cost-model-block">
+      <div class="cost-model-head">
+        <span class="cost-model-name">${escapeHtml(m.model || "—")}</span>
+        <span class="cost-model-total">${escapeHtml(m.formatted_cost || usd2(m.cost_usd || 0))}</span>
+      </div>
+      <table class="cost-table">
+        <thead><tr>
+          <th>${escapeHtml(T("modal.cost.col_category"))}</th>
+          <th class="cb-num">${escapeHtml(T("modal.cost.col_tokens"))}</th>
+          <th class="cb-num">${escapeHtml(T("modal.cost.col_rate"))}</th>
+          <th class="cb-num">${escapeHtml(T("modal.cost.col_subtotal"))}</th>
+        </tr></thead>
+        <tbody>
+          ${rowFor(T("modal.cost.cat_input"),        m.tokens_in,    p.input_per_m,       c.input_usd)}
+          ${rowFor(T("modal.cost.cat_output"),       m.tokens_out,   p.output_per_m,      c.output_usd)}
+          ${rowFor(T("modal.cost.cat_cache_read"),   m.cache_read,   p.cache_read_per_m,  c.cache_read_usd)}
+          ${rowFor(T("modal.cost.cat_cache_create"), m.cache_create, p.cache_write_per_m, c.cache_create_usd)}
+        </tbody>
+        <tfoot><tr>
+          <td colspan="3" class="cb-foot-label">${escapeHtml(T("modal.cost.model_total"))}</td>
+          <td class="cb-num cb-sub cb-total">${escapeHtml(m.formatted_cost || usd2(m.cost_usd || 0))}</td>
+        </tr></tfoot>
+      </table>
+    </div>`;
+  }).join("");
+
+  const totalUsd = models.reduce((a, m) => a + (m.cost_usd || 0), 0);
+  const sPlural = models.length === 1 ? "" : "s";
+
+  return `<div class="cost-breakdown" hidden>
+    <div class="cost-breakdown-h">
+      <span>${escapeHtml(T("modal.cost.title"))}</span>
+      <span class="muted">— ${escapeHtml(T("modal.cost.subtitle", { n: models.length, s: sPlural }))}</span>
+    </div>
+    ${blocks}
+    <div class="cost-grand-total">
+      <span>${escapeHtml(T("modal.cost.session_total"))}</span>
+      <span class="cb-total">${escapeHtml(detail.formatted_cost || usd2(totalUsd))}</span>
+    </div>
+  </div>`;
+}
+
+// Render the "PROMPTS (n)" section with a sort toggle. Exposed as a
+// single function so the click handler can re-emit just this section
+// when the user switches between cost-desc and chronological sort
+// without rebuilding the whole session modal.
+//
+// Sort keys:
+//   "cost"          — cost_tokens descending (most expensive first)
+//   "chronological" — ts ascending (prompt #1 is the first one asked)
+function buildPromptsSection(prompts, sortBy) {
+  const sorted = [...prompts];
+  if (sortBy === "chronological") {
+    sorted.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+  } else {
+    sortBy = "cost";
+    sorted.sort((a, b) => (b.cost_tokens || 0) - (a.cost_tokens || 0));
+  }
+  const pill = (key, label) => {
+    const active = sortBy === key ? " active" : "";
+    return `<button class="sort-pill${active}" data-sort="${key}">${label}</button>`;
+  };
+  return `<div class="prompts-section">
+    <div class="section-h">
+      <span>${T("modal.section.prompts", { n: prompts.length })}</span>
+      <span class="sort-pills">
+        ${pill("cost",          T("sort.by_cost"))}
+        ${pill("chronological", T("sort.chronological"))}
+      </span>
+    </div>
+    <div class="prompts-list">${sorted.map(buildPromptHtml).join("")}</div>
   </div>`;
 }
 
@@ -707,7 +835,7 @@ function buildPromptHtml(p, idx) {
   const text = textRaw.slice(0, 480);
   const llmMeta = llm
     ? `<div class="metrics-inline">
-         <span>${T("llm.session_prefix")==="会话"?"LLM 综合":"LLM aggregate"}: <b>${llm.aggregate.toFixed(2)}</b></span>
+         <span>${T("llm.aggregate_label")}: <b>${llm.aggregate.toFixed(2)}</b></span>
          <span>${T("llm.meaningful")}: <b>${llm.meaningful_value.toFixed(2)}</b></span>
          <span>${T("llm.durability")}: <b>${llm.output_durability.toFixed(2)}</b></span>
          <span>${T("llm.efficiency")}: <b>${llm.efficiency.toFixed(2)}</b></span>
@@ -720,22 +848,137 @@ function buildPromptHtml(p, idx) {
   const waste = llm ? renderWasteList(llm.wasteful_patterns) : "";
   const clsLabel = p.class ? T("roi." + p.class) : "—";
 
-  return `<div class="prompt-item cls-${clsKey}">
+  return `<div class="prompt-item cls-${clsKey}" tabindex="0" role="button"
+       aria-expanded="false" data-prompt-toggle
+       title="${escapeHtml(T("modal.prompt.expand_hint"))}">
     <div class="prompt-head">
       <div class="prompt-cls cls-${clsKey}">${escapeHtml(clsLabel)}</div>
       <div class="prompt-cost">#${idx + 1} · ${T("llm.cost")} ${fmtCompact(p.cost_tokens)} · ${T("chart.score_label")} ${(p.score ?? 0).toFixed(3)}</div>
-      <div></div>
+      <div class="prompt-chevron" aria-hidden="true">▾</div>
     </div>
     <div class="prompt-text ${long ? "long" : ""}">${escapeHtml(text)}</div>
     <div class="metrics-inline">
       <span>${T("modal.prompt.file_writes")}: <b>${fmtCompact(p.file_write_bytes)}</b></span>
-      <span>${T("modal.prompt.tool_calls")}: <b>${p.tool_calls}</b> (ok ${p.tool_successes})</span>
+      <span>${T("modal.prompt.tool_calls")}: <b>${p.tool_calls}</b> (${T("modal.prompt.ok_badge", { n: p.tool_successes })})</span>
       <span>${T("modal.prompt.retrieval_hits")}: <b>${p.retrieval_count}</b></span>
     </div>
     ${llmMeta}
     ${reason}
     ${waste}
+    ${buildPromptDetailHtml(p, textRaw)}
   </div>`;
+}
+
+// Hidden-by-default expansion shown when the user clicks a .prompt-item.
+// Reveals the full prompt text + per-prompt token breakdown that the
+// preview row only summarizes.
+function buildPromptDetailHtml(p, textFull) {
+  const tin   = p.tokens_in            || 0;
+  const tout  = p.tokens_out           || 0;
+  const cR    = p.cached_tokens        || 0;
+  const cC    = p.cache_creation_tokens|| 0;
+  const total = tin + tout + cR + cC;
+  const ts    = p.ts ? new Date(p.ts * 1000).toISOString().replace("T", " ").slice(0, 19) : "—";
+  const truncNote = p.text_truncated
+    ? `<div class="prompt-trunc-note muted">${escapeHtml(T("modal.prompt.text_truncated"))}</div>`
+    : "";
+  const tokenCell = (label, value, extraClass) => `
+    <div class="token-cell ${extraClass || ""}">
+      <div class="token-label">${escapeHtml(label)}</div>
+      <div class="token-value">${fmt(value)}</div>
+    </div>`;
+  return `<div class="prompt-detail" hidden>
+    <div class="prompt-detail-section">
+      <div class="prompt-detail-h">${escapeHtml(T("modal.prompt.full_prompt"))}</div>
+      <pre class="prompt-text-full">${escapeHtml(textFull)}</pre>
+      ${truncNote}
+    </div>
+    <div class="prompt-detail-section">
+      <div class="prompt-detail-h">${escapeHtml(T("modal.prompt.token_breakdown"))}</div>
+      <div class="token-grid">
+        ${tokenCell(T("modal.prompt.tokens_in"),    tin)}
+        ${tokenCell(T("modal.prompt.tokens_out"),   tout)}
+        ${tokenCell(T("modal.prompt.cache_read"),   cR)}
+        ${tokenCell(T("modal.prompt.cache_create"), cC)}
+        ${tokenCell(T("modal.prompt.tokens_total"), total, "token-cell-total")}
+      </div>
+      <div class="prompt-detail-meta">
+        <span>${escapeHtml(T("modal.prompt.model"))}: <b>${escapeHtml(p.model || "—")}</b></span>
+        <span>${escapeHtml(T("modal.prompt.timestamp"))}: <b>${escapeHtml(ts)} UTC</b></span>
+      </div>
+    </div>
+  </div>`;
+}
+
+// Idempotent: re-binding on the same element replaces the previous handler
+// (we tag it on the el). Toggles aria-expanded + the .expanded class on
+// the clicked .prompt-item. Clicks on selectable text inside the detail
+// pane don't re-collapse the card — that would make text selection awful.
+//
+// Also wires the TOTAL SPENT metric tile → cost-breakdown panel. Lives
+// in the same handler so the modal needs only one delegated listener.
+function wirePromptToggle(rootEl) {
+  if (rootEl._promptToggleBound) return;
+  rootEl._promptToggleBound = true;
+
+  const togglePrompt = (item) => {
+    const expanded = item.classList.toggle("expanded");
+    item.setAttribute("aria-expanded", expanded ? "true" : "false");
+    item.setAttribute("title",
+      T(expanded ? "modal.prompt.collapse_hint" : "modal.prompt.expand_hint"));
+    const detail = item.querySelector(".prompt-detail");
+    if (detail) {
+      if (expanded) detail.removeAttribute("hidden");
+      else          detail.setAttribute("hidden", "");
+    }
+  };
+
+  // Cost tile and its breakdown panel are siblings inside the metrics
+  // section. Toggling the tile shows/hides the panel that follows the
+  // .metrics grid.
+  const toggleCost = (tile) => {
+    const expanded = tile.classList.toggle("expanded");
+    tile.setAttribute("aria-expanded", expanded ? "true" : "false");
+    tile.setAttribute("title",
+      T(expanded ? "modal.cost.collapse_hint" : "modal.cost.click_hint"));
+    const section = tile.closest("div");  // the metrics wrapper
+    const panel = section && section.parentElement
+      ? section.parentElement.querySelector(".cost-breakdown")
+      : null;
+    if (panel) {
+      if (expanded) panel.removeAttribute("hidden");
+      else          panel.setAttribute("hidden", "");
+    }
+  };
+
+  rootEl.addEventListener("click", (ev) => {
+    const costTile = ev.target.closest(".metric[data-cost-toggle]");
+    if (costTile) { toggleCost(costTile); return; }
+
+    const item = ev.target.closest(".prompt-item[data-prompt-toggle]");
+    if (!item) return;
+    // Don't collapse when the user is selecting text inside the expanded
+    // detail pane — only the card header/body acts as the toggle hit area.
+    if (item.classList.contains("expanded") &&
+        ev.target.closest(".prompt-detail")) {
+      return;
+    }
+    togglePrompt(item);
+  });
+
+  rootEl.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter" && ev.key !== " ") return;
+    const costTile = ev.target.closest(".metric[data-cost-toggle]");
+    if (costTile && costTile === ev.target) {
+      ev.preventDefault();
+      toggleCost(costTile);
+      return;
+    }
+    const item = ev.target.closest(".prompt-item[data-prompt-toggle]");
+    if (!item || item !== ev.target) return;
+    ev.preventDefault();
+    togglePrompt(item);
+  });
 }
 
 function renderWasteList(patterns) {
@@ -816,10 +1059,11 @@ async function openSessionDetail(sessionId, highlightPromptId) {
     modal.clsBadge().className = "modal-class " + clsSuffix(detail.roi_class);
 
     const prompts = Array.isArray(detail.prompts) ? detail.prompts : [];
+    // Remember last-chosen sort across modal opens so clicking through
+    // a lot of sessions doesn't force the user to re-toggle every time.
+    const initialSort = openSessionDetail._promptSort || "cost";
     const promptsHtml = prompts.length
-      ? `<div><div class="section-h">${T("modal.section.prompts", { n: prompts.length })}</div>
-          <div class="prompts-list">${prompts.map(buildPromptHtml).join("")}</div>
-        </div>`
+      ? buildPromptsSection(prompts, initialSort)
       : `<div class="muted">${T("modal.no_prompts")}</div>`;
 
     modal.body().innerHTML = [
@@ -829,6 +1073,37 @@ async function openSessionDetail(sessionId, highlightPromptId) {
       buildFilesHtml(detail),
       buildToolsHtml(detail),
     ].join("");
+
+    // Delegated click handler for prompt expansion. Lives on modal.body()
+    // so it survives the sort-pill re-render of .prompts-section. Stored
+    // on the body el so we never double-bind across openSessionDetail calls.
+    wirePromptToggle(modal.body());
+
+    // Wire the sort-pill clicks. We replace only the prompts section on
+    // sort change, leaving the why / metrics / files sections untouched.
+    modal.body().querySelectorAll(".sort-pill").forEach((btn) => {
+      btn.addEventListener("click", (ev) => {
+        const sort = ev.currentTarget.dataset.sort;
+        openSessionDetail._promptSort = sort;
+        const section = modal.body().querySelector(".prompts-section");
+        if (!section) return;
+        const placeholder = document.createElement("div");
+        placeholder.innerHTML = buildPromptsSection(prompts, sort);
+        section.replaceWith(placeholder.firstElementChild);
+        // Re-bind pill clicks on the fresh DOM.
+        modal.body().querySelectorAll(".sort-pill").forEach((b) => {
+          b.addEventListener("click", (e) => {
+            const s = e.currentTarget.dataset.sort;
+            openSessionDetail._promptSort = s;
+            const sec = modal.body().querySelector(".prompts-section");
+            const tmp = document.createElement("div");
+            tmp.innerHTML = buildPromptsSection(prompts, s);
+            sec.replaceWith(tmp.firstElementChild);
+            // (Three-deep re-bind is fine; clicks rarely exceed 2 toggles.)
+          });
+        });
+      });
+    });
 
     if (highlightPromptId) {
       // Find the matching prompt-item and scroll into view with a flash.

@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from .db import AnalyticsDB
-from .events import Event, EventType
+from .events import Event, EventType, is_synthetic_prompt
 from .i18n import get_locale
 
 log = logging.getLogger(__name__)
@@ -267,98 +267,174 @@ JUDGMENT_RESPONSE_FORMAT: dict = {
 # management audience auditing AI-assisted developer productivity — same
 # adversarial scoring anchor as the English version, translated carefully
 # so the LLM outputs Chinese reasoning and Chinese wasteful_patterns.
-JUDGE_SYSTEM_PROMPT_EN = """You are a harsh, skeptical senior engineer reviewing whether an AI coding assistant's work was worth the tokens it cost. You are NOT here to validate the user or the assistant — you are here to find waste. Every agentic session has waste. Your job is to find and name it, precisely, using the concrete numbers provided.
+JUDGE_SYSTEM_PROMPT_EN = """You are a senior engineer reviewing whether an AI coding assistant's work was worth the tokens it cost. Your job is to **fairly assess value**, not hunt for waste. Some sessions are genuinely good; some are bad. Score honestly — under-scoring good work is as misleading as sugar-coating bad work.
 
-=== SCORING ANCHORS (read carefully before you pick numbers) ===
+=== STEP 1. CLASSIFY THE WORK TYPE (DO THIS FIRST) ===
 
-Do NOT default to the 0.7–0.9 range. That is reserved for genuinely exceptional work and should be rare. Most real sessions fall in 0.4–0.6. Anchor every dimension like this:
+Before any scoring, identify what the user actually asked for. The evaluation rubric shifts substantially by type:
 
-  0.0–0.2  Clear waste. Churn, re-reads of the same files, verbose narration with little durable output, exploration that produced nothing, or code that looks written but does not solve the user's problem.
-  0.3–0.4  Marginal. The assistant made progress but overhead consumed most of the tokens — redundant tool calls, over-engineered solutions, repeated iteration on the same artifacts.
-  0.5–0.6  Normal. Genuine progress with the usual amount of overhead. This is where most sessions belong.
-  0.7–0.8  Above average. Clear progress, relatively disciplined tool use, artifacts that justify the cost.
-  0.9–1.0  Exceptional. Reserved for focused, efficient sessions where nearly every token produced durable value. VERY rare; if you find yourself scoring above 0.8, re-check the waste indicators and explain why the session beats the anchor.
+  BUILD     — produce new code / files / content ("add feature X", "write lesson Y")
+  FIX       — correct a specific bug or failure ("tests are failing", "this errors")
+  REFACTOR  — restructure existing code without behavior change
+  REVIEW    — analyze existing code for issues ("review my project", "audit this")
+              → THE OUTPUT IS THE FINDINGS, not files
+  DEBUG     — investigate a symptom and identify root cause
+              → THE OUTPUT IS THE EXPLANATION, not files
+  EXPLAIN   — answer a technical question
+              → THE OUTPUT IS THE ANSWER
+  DESIGN    — sketch an approach before building
+              → THE OUTPUT IS THE SPECIFICATION
+  EXPLORE   — wander around without a clear goal (judge skeptically)
 
-If your scores cluster above 0.7, you are sugar-coating. Re-calibrate downward.
+Name the work type in the first sentence of `reasoning`. This makes your grading auditable.
 
-=== READ THE WASTE INDICATORS THE USER PROVIDES ===
+=== STEP 2. EVALUATE ACCORDING TO WORK TYPE ===
 
-The user's message contains a "WASTE INDICATORS" section with hard numbers. Treat those as primary evidence, not the narrative text:
+For **BUILD / FIX / REFACTOR**:
+  - meaningful_value: Did the code solve the ACTUAL problem, not an adjacent one?
+  - output_durability: Will the artifacts be maintained and referenced?
+  - efficiency: Tokens spent vs bytes of correct code shipped.
+    A high `talk_to_do_ratio` is a real red flag HERE — narration should be brief, code should dominate.
+  - `file_reread_ratio > 2.0` and `file_rewrite_ratio > 2.0` are genuine thrashing signals for this type.
 
-  - file_reread_ratio > 2.0          → agent re-read the same files; thrashing
-  - file_rewrite_ratio > 2.0         → agent iterated over the same files; wrong-then-fix
-  - tool_error_rate > 10%            → retries are eating tokens
-  - talk_to_do_ratio > 100           → lots of narration, little code actually produced
-  - talk_to_do_ratio = inf           → pure chat turn, zero durable output
+For **REVIEW / DEBUG / EXPLAIN / DESIGN**:
+  - meaningful_value: Are the findings / explanation / plan **concrete, specific, and accurate**?
+    - "There might be a performance issue somewhere" → LOW (vague)
+    - "Line 45 has an O(n²) loop that blows up at n>10K" → HIGH (specific, actionable)
+    - Counting 5 real bugs with file:line references → HIGH
+    - Hand-waving about architecture in 2000 tokens → LOW
+  - output_durability: Will the findings be actionable NEXT WEEK?
+    - Bug report naming file + line + fix → HIGH
+    - Vague "consider refactoring this module" → LOW
+  - efficiency: Density of insight per token.
+    **`talk_to_do_ratio` is NOT a penalty here — talk IS the deliverable.**
+    What matters: is the talk dense with specific findings, or padded with hedges and recap?
+  - `file_reread_ratio > 2` can still be waste if the re-reads didn't inform distinct findings; but multiple reads that each produced a specific observation is normal investigation work.
 
-If any of those indicators are flagged, efficiency MUST score below 0.5, and you MUST name the pattern in `wasteful_patterns` verbatim.
+For **EXPLORE**:
+  - Judge skeptically. Exploration without a clear goal rarely produces durable value. But occasionally surfaces a useful finding — credit those specifically.
 
-=== REQUIRED OUTPUT ===
+=== STEP 3. SCORING ANCHORS ===
 
-1. meaningful_value_score [0..1]   — Did the session accomplish the user's ACTUAL ask, not something adjacent or easier?
-2. code_was_produced (bool)        — true iff concrete artifacts (code/config/content) were written
-3. code_quality_score [0..1]       — If true: correctness/maintainability/over-engineering penalty. If false: 0.
-4. output_durability [0..1]        — Will these artifacts be referenced next week, or is this throwaway?
-5. efficiency [0..1]               — Tokens spent vs tokens that could have gotten the same result with a focused human. PENALIZE bloat, thrashing, redundant tool calls.
-6. wasteful_patterns (array)       — REQUIRED: 1+ concrete waste items you observed. Cite the specific indicator and count. Examples:
-       "Re-read src/foo.py 8 times (file_reread_ratio 4.0)"
-       "47 Bash calls for a 100-line edit"
-       "2,000-token recap in the final message"
-       "Over-engineered a 3-line fix into a 200-line module"
-       "Regenerated 3 files that were immediately overwritten"
-     If you genuinely find nothing — which should be VERY rare — put ["no material waste found"] AND defend that in `reasoning` with specific evidence.
-7. reasoning — 2-4 sentences. Be direct. Cite specific numbers or specific text. Do NOT praise.
+Anchor at **0.5** for all dimensions. Move up or down based on specific evidence. Good work should score 0.6–0.8 regularly — that's NOT sugar-coating, that's accurate evaluation of competent execution.
 
-=== TONE ===
+  0.0–0.2  Clear failure. Did the wrong task, or produced nothing usable.
+  0.3–0.4  Below baseline. Task partially done; overhead dominated; findings vague.
+  0.5–0.6  Normal. Task completed, reasonable overhead, findings specific enough.
+  0.7–0.8  Good. Focused work; artifacts solid; findings concrete and actionable.
+  0.9–1.0  Exceptional. Near-flawless execution; justify in reasoning.
 
-Write like a staff engineer doing a critical review, not a coach. If the user's prompt was vague or changed direction mid-stream, say so. If the assistant over-narrated or padded the response, say so. Do not use hedging words like "potentially", "somewhat", "generally". Be concrete."""
+**Do NOT anchor downward by default.** A session that identified 3 real bugs with file:line citations and did so in 40K tokens is legitimately 0.75+ on meaningful_value and 0.7+ on output_durability for a REVIEW. Don't drag it to 0.5 because "talk_to_do_ratio is inf" — that's the wrong metric for that work type.
+
+=== STEP 4. WASTE PATTERNS ===
+
+Report concrete waste ONLY when the evidence is real.
+
+WASTE IS:
+  - Re-reading the same file 5+ times without producing distinct findings
+  - Rewriting the same code 3+ times (wrong-then-fix spiral)
+  - Narration that doesn't contain findings, decisions, or code
+  - Tool calls that don't advance the task
+  - Solving a different problem than the user asked
+  - Over-engineering beyond scope
+
+WASTE IS **NOT**:
+  - High `talk_to_do_ratio` for REVIEW / DEBUG / EXPLAIN / DESIGN — for these, talk IS the output
+  - Multiple file reads if each read informed a distinct, specific observation
+  - Length if the content is dense with substantive findings
+  - Thorough exploration when the user explicitly asked for exploration
+  - Analysis that produced no files when the user asked for analysis, not code
+
+If `wasteful_patterns` genuinely has nothing to report, put `["no material waste found"]` and defend that in `reasoning` with specifics. This is NOT rare — well-run sessions legitimately earn it.
+
+=== STEP 5. REASONING ===
+
+2–4 sentences. First sentence: name the work type. Then justify the scores with specific evidence — cite numbers, file names, or concrete findings. Be direct but fair. Credit good work. Name bad work. Don't use hedges ("potentially", "somewhat", "generally")."""
 
 
-JUDGE_SYSTEM_PROMPT_ZH = """你是一位严格、持怀疑态度的资深工程师，正在评审一位 AI 编码助手的工作是否值得它所消耗的 Token。你不是来为用户或助手背书的——你是来找出浪费的。每一次智能体会话都存在浪费。你的任务是根据提供的具体数字，精确地找出并命名它们。
+JUDGE_SYSTEM_PROMPT_ZH = """你是一位资深工程师，正在评审一位 AI 编码助手的工作是否值得它所消耗的 Token。你的任务是**公平地评估价值**，而不是一味找浪费。有些会话确实优秀，有些确实糟糕。请诚实评分 —— 低估好工作和美化坏工作一样具有误导性。
 
-=== 评分锚点（选择分数前请仔细阅读）===
+=== 第一步：先判定工作类型 ===
 
-不要默认使用 0.7–0.9 区间。该区间仅保留给真正卓越的工作，应当很少出现。绝大多数真实会话应落在 0.4–0.6。请按以下标准为每个维度锚定分数：
+在评分之前，先识别用户实际想要什么。评分标准会因类型而大不相同：
 
-  0.0–0.2  明显浪费。空转、反复读取同一文件、冗长叙述但缺乏持久产出、探索无果，或看起来写了代码但并未解决用户问题。
-  0.3–0.4  价值有限。助手有所进展，但开销占用了大部分 Token——冗余工具调用、过度设计的方案、对同一产物反复迭代。
-  0.5–0.6  正常水平。具备真实进展且开销尚可。大多数会话应落在此区间。
-  0.7–0.8  高于平均。进展清晰、工具使用相对克制、产物足以抵消其成本。
-  0.9–1.0  卓越。仅保留给专注、高效、几乎每个 Token 都产出持久价值的会话。非常罕见；若你将任一维度打到 0.8 以上，请重新检查浪费指标并说明该会话凭什么超过锚点。
+  BUILD    — 新建代码 / 文件 / 内容（「添加功能 X」「写课程 Y」）
+  FIX      — 修复具体 bug 或故障（「测试挂了」「这里报错」）
+  REFACTOR — 重构现有代码但不改变行为
+  REVIEW   — 审查现有代码找问题（「审查我的项目」「检查这里」）
+             → 产出就是「发现」本身，不是文件
+  DEBUG    — 排查症状，定位根因
+             → 产出就是「解释」本身，不是文件
+  EXPLAIN  — 回答技术问题
+             → 产出就是「答案」本身
+  DESIGN   — 在动工前先画方案
+             → 产出就是「规格」本身
+  EXPLORE  — 无明确目标的漫游（需谨慎评分）
 
-若分数集中在 0.7 以上，你在美化结果。请向下重新校准。
+请在 `reasoning` 的第一句明确指出本次工作类型。这样评分就可以被审计。
 
-=== 请认真阅读用户提供的「浪费指标」 ===
+=== 第二步：按工作类型评估 ===
 
-用户消息中有一个「WASTE INDICATORS」区块，其中包含硬性数字。请将其视为主要证据，而非仅依据叙述文本：
+对于 **BUILD / FIX / REFACTOR**：
+  - meaningful_value：代码是否解决了**实际问题**，而不是相邻或更简单的问题？
+  - output_durability：这些产物未来还会被维护和引用吗？
+  - efficiency：所花 Token 相对于真正交付的代码字节数。
+    此类工作下 `talk_to_do_ratio` 确实是**真实红旗** —— 叙述应简短，代码应占主导。
+  - `file_reread_ratio > 2.0` 和 `file_rewrite_ratio > 2.0` 对此类工作是真正的空转信号。
 
-  - file_reread_ratio > 2.0   →  助手重复读取同一文件；在空转
-  - file_rewrite_ratio > 2.0  →  助手对同一文件反复迭代；先错后改
-  - tool_error_rate > 10%     →  重试正在消耗 Token
-  - talk_to_do_ratio > 100    →  大量叙述，真正产出的代码很少
-  - talk_to_do_ratio = inf    →  纯聊天回合，零持久产出
+对于 **REVIEW / DEBUG / EXPLAIN / DESIGN**：
+  - meaningful_value：发现 / 解释 / 方案是否**具体、明确、准确**？
+    - 「某处可能有性能问题」 → 低分（含糊）
+    - 「第 45 行是 O(n²) 循环，n>10K 时会超时」 → 高分（具体、可执行）
+    - 找出 5 个真 bug 并给出 file:line 引用 → 高分
+    - 2000 Token 的架构空谈 → 低分
+  - output_durability：这些发现下周还能被付诸行动吗？
+    - 给出文件 + 行号 + 修复方案的 bug 报告 → 高分
+    - 「考虑重构这个模块」这种含糊建议 → 低分
+  - efficiency：每个 Token 带来的洞察密度。
+    **`talk_to_do_ratio` 在此类工作下不应扣分 —— 「talk」本身就是交付物。**
+    关键是：这段「talk」是密集的具体发现，还是充斥着模糊措辞和重复总结？
+  - `file_reread_ratio > 2` 在此类工作下仍可能是浪费，但前提是重读并未带来独立的新发现；多次阅读若每次都产生了具体观察，则属于正常的调查工作。
 
-一旦上述任一指标被标记，efficiency（效率）必须低于 0.5，且你必须在 `wasteful_patterns` 中原样点名该模式。
+对于 **EXPLORE**：
+  - 谨慎评分。无明确目标的探索很少产出持久价值。但偶尔会浮现有用发现 —— 请具体给予肯定。
 
-=== 必填输出（必须使用简体中文回答 reasoning 与 wasteful_patterns）===
+=== 第三步：评分锚点 ===
 
-1. meaningful_value_score [0..1]  — 本会话是否完成了用户的实际诉求，而不是改做相邻或更简单的任务？
-2. code_was_produced (bool)       — 当且仅当产生了具体产物（代码 / 配置 / 内容）时为 true
-3. code_quality_score [0..1]      — 若为 true：从正确性 / 可维护性 / 过度设计角度扣分。若为 false：填 0。
-4. output_durability [0..1]       — 这些产物下周是否还有人引用，还是一次性的？
-5. efficiency [0..1]              — 所花 Token 相比专注人类完成同样任务所需 Token。要惩罚臃肿、空转、冗余工具调用。
-6. wasteful_patterns (数组)       — 必填：至少写出 1 条具体浪费项。引用具体指标与数量。示例：
-       "重复读取 src/foo.py 8 次（file_reread_ratio 4.0）"
-       "47 次 Bash 调用仅完成 100 行编辑"
-       "最终消息出现 2000 Token 的回顾总结"
-       "将 3 行修复过度设计为 200 行模块"
-       "重新生成 3 个随即被覆盖的文件"
-     若确实未发现（应极为罕见），填 ["未发现重大浪费"] 并在 `reasoning` 中以具体证据捍卫该结论。
-7. reasoning — 2–4 句，用简体中文。直截了当，引用具体数字或具体文本。不要赞美。
+所有维度的锚点为 **0.5**。根据具体证据上下调整。**良好的工作应当经常落在 0.6–0.8 区间 —— 这不是美化，是对称职执行的准确评价**。
 
-=== 语气 ===
+  0.0–0.2  明显失败。做错了任务，或未产出任何可用内容。
+  0.3–0.4  低于基线。任务仅部分完成，开销占主导，发现含糊。
+  0.5–0.6  正常水平。任务完成，开销合理，发现足够具体。
+  0.7–0.8  良好。专注、产物扎实、发现具体且可执行。
+  0.9–1.0  卓越。近乎完美的执行；请在 reasoning 中说明理由。
 
-以首席工程师进行严格评审的口吻书写，不要像教练。若用户的提示模糊或中途改变方向，请直接指出。若助手过度叙述或回答冗长，请直接指出。不要使用「可能」「某种程度上」「大体上」等含糊用词，要具体。"""
+**不要默认向下锚定**。一次会话如果指出 3 个带 file:line 引用的真 bug、用了 40K Token 完成，meaningful_value 理应 0.75+、output_durability 理应 0.7+（对 REVIEW 类）。不要因为「talk_to_do_ratio 为无穷」就把它拖到 0.5 —— 那是错的度量指标。
+
+=== 第四步：浪费模式 ===
+
+仅在**证据确凿**时报告浪费。
+
+浪费**是**：
+  - 同一文件读 5 次以上却未产出独立发现
+  - 同一段代码改写 3 次以上（先错后改的螺旋）
+  - 既无发现、无决定、也无代码的纯叙述
+  - 未推进任务的工具调用
+  - 解决了与用户所问不同的问题
+  - 超出范围的过度设计
+
+浪费**不是**：
+  - REVIEW / DEBUG / EXPLAIN / DESIGN 类工作的高 `talk_to_do_ratio` —— 对此类工作，talk 就是产出
+  - 多次读文件，只要每次都带来了独立的具体观察
+  - 文本长但内容密集、富含具体发现
+  - 用户明确要求的深入探索
+  - 用户要求的是分析而非代码时，未产出文件
+
+若 `wasteful_patterns` 确实没什么可报告，请填 `["未发现重大浪费"]`，并在 `reasoning` 中以具体证据为此辩护。**这种情况并不罕见** —— 运作良好的会话理应如此。
+
+=== 第五步：reasoning 撰写 ===
+
+2–4 句，简体中文。第一句必须点明工作类型，然后用具体证据支撑评分 —— 引用数字、文件名、或具体发现。要直接但要公平。对好工作要给予认可，对坏工作要直接点名。不要用「可能」「某种程度上」「大体上」这类含糊措辞。"""
 
 
 def _judge_system_prompt(locale: str) -> str:
@@ -523,10 +599,66 @@ SESSION_SUMMARY_SYSTEM_PROMPT_ZH = """你正在总结一次用户与 AI 编码�
 SESSION_SUMMARY_SYSTEM_PROMPT = SESSION_SUMMARY_SYSTEM_PROMPT_EN  # back-compat
 
 
+PROJECT_SUMMARY_SYSTEM_PROMPT_EN = """You are naming a *project* — a collection of coding sessions that share a workspace / repo.
+
+Given the project slug (path-encoded cwd), the per-session names + summaries, and the top files written across every session, produce:
+  1. A short project name (3-6 words) — what does this project actually DO? Prefer a concrete real-world framing ("Algorithms learning site", "Bossify tooling", "Discrete-math study hub") over literal file-path echoes.
+  2. A one-sentence description — the concrete outcome of the project's work so far, not a generic "various sessions on X".
+
+Avoid generic names ("Coding project", "Development work"). Use real domain nouns from the session names / file paths. If multiple themes coexist, pick the dominant one.
+
+Output strict JSON only."""
+
+
+PROJECT_SUMMARY_SYSTEM_PROMPT_ZH = """你正在为一个**项目**命名——一个由共享工作区/代码仓的编码会话组成的集合。
+
+给定项目 slug（路径编码的工作目录）、每个会话的名称与摘要，以及所有会话累计写入的主要文件，请输出：
+  1. 一个简短的项目名称（3–8 个汉字）——这个项目究竟在做什么？优先用具体的现实语义（如「算法学习站」「Bossify 工具」「离散数学学习中心」），不要机械地照抄文件路径。
+  2. 一句话描述——目前项目的具体成果，而不是「关于 X 的多次会话」这种模糊说法。
+
+避免通用名称（「编程项目」「开发工作」）。请使用会话名称与文件路径中的真实领域名词。若存在多个主题，取主导主题。
+
+仅输出严格的 JSON，使用简体中文。"""
+
+
 def _session_summary_system_prompt(locale: str) -> str:
     if locale == "zh":
         return SESSION_SUMMARY_SYSTEM_PROMPT_ZH
     return SESSION_SUMMARY_SYSTEM_PROMPT_EN
+
+
+def _project_summary_system_prompt(locale: str) -> str:
+    if locale == "zh":
+        return PROJECT_SUMMARY_SYSTEM_PROMPT_ZH
+    return PROJECT_SUMMARY_SYSTEM_PROMPT_EN
+
+
+def _slug_to_display(slug: str) -> str:
+    """Fallback display name when no LLM naming has run yet.
+
+    Claude Code's slugs look like ``-Users-alice-Desktop-Workspace-algo``.
+    We pick the last non-empty segment so the dashboard shows ``algo``
+    rather than a 60-char path encoding.
+    """
+    parts = [p for p in (slug or "").split("-") if p]
+    if not parts:
+        return slug or "(unknown)"
+    return parts[-1]
+
+
+@dataclass
+class ProjectSummary:
+    """LLM-produced display name + one-line description for a project.
+
+    A project is a bag of sessions sharing the same Claude Code project
+    slug. The summary is cached in the ``projects`` table so re-running
+    ``token-roi name-projects`` is idempotent.
+    """
+    slug: str
+    display_name: str
+    description: str
+    model: str = "unknown"
+    generated_at: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -557,16 +689,24 @@ class Judgment:
     # Aggregate a single "value score" useful as a proxy in ROI.
     @property
     def aggregate(self) -> float:
-        """Weighted geometric mean of meaningful + durability.
+        """Geometric mean of meaningful × durability × efficiency.
 
-        Geometric mean penalizes imbalance: a prompt rated 0.9 meaningful
-        but 0.1 durable scores lower than one rated 0.5 on both. That
-        matches the ROI intuition — transient-but-clever work is
-        transient.
+        Efficiency is folded in so a session that accomplishes the task
+        but burns absurd tokens (e.g. 104K tokens to flip a single JSON
+        key) cannot earn a perfect aggregate just because the work got
+        done. With three terms, a single 0.3 drags the aggregate below
+        ~0.7 no matter how strong the other two are — which matches the
+        "harsh, not flattering" design principle.
+
+        Earlier versions computed ``sqrt(meaningful × durability)`` and
+        ignored efficiency entirely; the ROI layer had to patch over it
+        downstream. The three-term mean makes the reported number
+        actually reflect how the boss would judge the spend.
         """
-        a = max(0.0, min(1.0, self.meaningful_value))
-        b = max(0.0, min(1.0, self.output_durability))
-        return (a * b) ** 0.5
+        m = max(0.0, min(1.0, self.meaningful_value))
+        d = max(0.0, min(1.0, self.output_durability))
+        e = max(0.0, min(1.0, self.efficiency))
+        return (m * d * e) ** (1.0 / 3.0)
 
     def to_row(self) -> dict:
         return {
@@ -620,6 +760,19 @@ class Judge:
         self, *, session_id: str | None = None, since_ts: float | None = None,
         force: bool = False,
     ) -> list[sqlite3.Row]:
+        """Un-judged real user prompts in deterministic order.
+
+        "Un-judged" is locale-aware: a prompt whose cached judgment was
+        produced in a different ``TOKEN_ROI_LOCALE`` is treated as
+        needing re-judging, so switching the UI language and re-running
+        ``token-roi judge`` regenerates the reasoning / wasteful-pattern
+        strings in the right language.
+
+        Also filters out synthetic prompts (slash-command wrappers,
+        post-compaction restarts, task notifications) — those carry no
+        intent and shouldn't consume LLM judge time. Already-imported
+        data may still have them in ``events``, so we filter here too.
+        """
         where = ["e.type = 'user_prompt'"]
         args: list = []
         if session_id:
@@ -627,7 +780,8 @@ class Judge:
         if since_ts is not None:
             where.append("e.ts >= ?"); args.append(since_ts)
         if not force:
-            where.append("j.prompt_event_id IS NULL")
+            where.append("(j.prompt_event_id IS NULL OR j.locale != ?)")
+            args.append(self.locale)
         sql = f"""
             SELECT e.id, e.session_id, e.ts, e.payload_json
             FROM events e
@@ -635,7 +789,17 @@ class Judge:
             WHERE {" AND ".join(where)}
             ORDER BY e.ts ASC
         """
-        return self.db._conn.execute(sql, args).fetchall()
+        rows = self.db._conn.execute(sql, args).fetchall()
+        clean: list[sqlite3.Row] = []
+        for r in rows:
+            try:
+                text = json.loads(r["payload_json"] or "{}").get("text", "")
+            except (json.JSONDecodeError, TypeError):
+                text = ""
+            if is_synthetic_prompt(text):
+                continue
+            clean.append(r)
+        return clean
 
     # ---- context assembly ----
 
@@ -839,6 +1003,21 @@ class Judge:
     # ---- session summaries ----
 
     def sessions_needing_summary(self, *, force: bool = False) -> list[str]:
+        """Return session ids that still need an LLM-generated name.
+
+        Importer pre-populates ``session_summaries`` with a
+        ``metadata-only`` placeholder row (empty name + empty summary +
+        project_slug + employee_id) so downstream joins don't lose
+        sessions that haven't been named yet. A naive
+        ``LEFT JOIN … WHERE s.session_id IS NULL`` filter misses those
+        placeholders and leaves the dashboard showing anonymous UUIDs
+        forever. The ``name = ''`` / ``model = 'metadata-only'`` guards
+        correctly flag placeholder rows as needing naming.
+
+        Locale-aware: a session whose cached name was generated in a
+        different locale than the one the namer is about to run under
+        is re-queued so the dashboard can render cleanly in one language.
+        """
         if force:
             return self.db.all_sessions()
         rows = self.db._conn.execute(
@@ -846,7 +1025,12 @@ class Judge:
                  FROM events e
                  LEFT JOIN session_summaries s ON s.session_id = e.session_id
                 WHERE s.session_id IS NULL
-                ORDER BY e.session_id"""
+                   OR s.name IS NULL
+                   OR s.name = ''
+                   OR s.model = 'metadata-only'
+                   OR s.locale != ?
+                ORDER BY e.session_id""",
+            (self.locale,),
         ).fetchall()
         return [r["session_id"] for r in rows]
 
@@ -1059,6 +1243,122 @@ class Judge:
                 print(f"[{i}/{len(sessions)}] {sid[:12]}  {summary.name!r}  "
                       f"({time.time() - t0:.1f}s)")
             yield summary
+
+    # ---- project summaries ----
+
+    def summarize_project(self, project_slug: str) -> "ProjectSummary":
+        """Ask the LLM for a human-readable name + description of a project.
+
+        A "project" groups every session that shares a Claude Code
+        project slug (path-encoded cwd). We feed the LLM the slug, the
+        session-name list, and the top files written across sessions —
+        that's enough for it to name the project concretely (e.g.
+        "Bossify tooling" or "CLRS lesson site").
+        """
+        session_rows = self.db._conn.execute(
+            """SELECT session_id, name, summary
+                 FROM session_summaries
+                WHERE project_slug = ?""",
+            (project_slug,),
+        ).fetchall()
+        sids = [r["session_id"] for r in session_rows]
+        if not sids:
+            return ProjectSummary(
+                slug=project_slug,
+                display_name=_slug_to_display(project_slug),
+                description="",
+                model="rule-based",
+            )
+
+        placeholders = ",".join("?" for _ in sids)
+        file_rows = self.db._conn.execute(
+            f"""SELECT json_extract(payload_json, '$.path') AS path,
+                       SUM(json_extract(payload_json, '$.bytes')) AS bytes,
+                       COUNT(*) AS writes
+                  FROM events
+                 WHERE session_id IN ({placeholders}) AND type = 'file_write'
+                 GROUP BY path
+                 ORDER BY bytes DESC
+                 LIMIT 20""",
+            sids,
+        ).fetchall()
+
+        session_lines = [
+            f"- [{r['name'] or r['session_id'][:8]}] {(r['summary'] or '').strip()[:140]}"
+            for r in session_rows[:25]
+        ]
+        file_lines = [
+            f"- {r['path']}  ({int(r['bytes'] or 0):,} bytes, {r['writes']}x)"
+            for r in file_rows if r["path"]
+        ] or ["(no files written)"]
+
+        ctx = "\n".join([
+            "# PROJECT CONTEXT",
+            f"slug (path-encoded cwd): {project_slug}",
+            f"sessions: {len(sids)}",
+            "",
+            "# SESSION NAMES + SUMMARIES",
+            *session_lines,
+            "",
+            "# TOP FILES WRITTEN (across all sessions)",
+            *file_lines,
+        ])
+        if len(ctx) > 12000:
+            ctx = ctx[:12000] + "\n\n[... truncated ...]"
+
+        resp = self.llm.chat(
+            messages=[
+                {"role": "system", "content": _project_summary_system_prompt(self.locale)},
+                {"role": "user",   "content": ctx},
+            ],
+            temperature=0.2,
+            max_tokens=400,
+            response_format=SESSION_SUMMARY_RESPONSE_FORMAT,
+        )
+        parsed = _parse_judgment_json(resp.text)
+        name = (parsed.get("name") or "").strip() or _slug_to_display(project_slug)
+        summary = (parsed.get("summary") or "").strip()
+        return ProjectSummary(
+            slug=project_slug,
+            display_name=_safe_name(name),
+            description=summary[:300],
+            model=resp.model,
+        )
+
+    def summarize_projects(
+        self, *, force: bool = False, progress: bool = True,
+    ) -> Iterator["ProjectSummary"]:
+        slugs = (
+            self.db._conn.execute(
+                """SELECT DISTINCT project_slug FROM session_summaries
+                    WHERE project_slug IS NOT NULL AND project_slug != ''"""
+            ).fetchall()
+            if force else None
+        )
+        if force:
+            pending = [r["project_slug"] for r in slugs]
+        else:
+            pending = self.db.projects_needing_name(locale=self.locale)
+        for i, slug in enumerate(pending, 1):
+            t0 = time.time()
+            try:
+                ps = self.summarize_project(slug)
+            except Exception as e:  # noqa: BLE001
+                log.error("summarize_project failed on %s: %s", slug, e)
+                if progress:
+                    print(f"[{i}/{len(pending)}] {slug[:32]}  ERROR: {e}")
+                continue
+            self.db.upsert_project(
+                slug=ps.slug,
+                display_name=ps.display_name,
+                description=ps.description,
+                model=ps.model,
+                generated_at=time.time(),
+            )
+            if progress:
+                print(f"[{i}/{len(pending)}] {slug[:32]:<32}  "
+                      f"{ps.display_name!r}  ({time.time() - t0:.1f}s)")
+            yield ps
 
     def judge_all(
         self,

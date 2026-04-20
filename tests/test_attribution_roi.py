@@ -5,6 +5,8 @@ and verify the classifier lands on the right side.
 """
 from __future__ import annotations
 
+import pytest
+
 from token_roi.attribution import AttributionGraph
 from token_roi.db import AnalyticsDB
 from token_roi.events import EventType, make_event
@@ -141,6 +143,83 @@ def test_retrospective_proxies_lift_historical_data(store, db):
     assert sa.cls != ROIClass.WASTED
     # B still is WASTED (score ~0).
     assert sb.cls == ROIClass.WASTED
+
+
+def test_meaningful_floor_rescues_ephemeral_real_work_from_wasted():
+    """A review-style prompt (meaningful=0.5, durability=0.3, efficiency=0.25)
+    has aggregate ≈ 0.335 — under the old classifier it would land in
+    WASTED, because the cube-root aggregate dragged below 0.35. But
+    the LLM still judged the *content* meaningful (>= 0.5), so the
+    right class is LOW_VALUE, not WASTED.
+
+    This is the 'code review that finds real bugs but produces zero
+    files' case — real work, just not captured durably. Calling it
+    WASTED mis-represents what happened.
+    """
+    from token_roi.attribution import Attribution
+    from token_roi.roi import _classify
+
+    a = Attribution(
+        prompt_event_id="p",
+        session_id="s",
+        cost_tokens=436_000,
+        durable_bytes=0,
+        retrieval_count=0,
+        outcome_score=0.0,
+        reuse_score=0.0,
+        file_write_bytes=0,
+        tool_calls=13,
+        tool_successes=13,
+    )
+    # Aggregate 0.335 = (0.5 * 0.3 * 0.25) ** (1/3).
+    cls = _classify(
+        score=0.063, a=a,
+        v_llm=0.335, llm_efficiency=0.25, llm_meaningful=0.50,
+    )
+    assert cls.value == "LOW_VALUE", cls
+
+
+def test_low_meaningful_prompt_is_still_wasted():
+    """Regression guard: a prompt with meaningful < 0.5 AND aggregate
+    < 0.35 must still land in WASTED. We're softening the WASTED band
+    only for real-work-with-no-artifact, not for everything."""
+    from token_roi.attribution import Attribution
+    from token_roi.roi import _classify
+
+    a = Attribution(
+        prompt_event_id="p", session_id="s",
+        cost_tokens=50_000, durable_bytes=0, retrieval_count=0,
+        outcome_score=0.0, reuse_score=0.0,
+    )
+    # aggregate 0.15 from low meaning/durability/efficiency all round.
+    cls = _classify(
+        score=0.02, a=a,
+        v_llm=0.15, llm_efficiency=0.2, llm_meaningful=0.3,
+    )
+    assert cls.value == "WASTED"
+
+
+def test_diminishing_is_normalised_to_reuse_saturation():
+    """``_diminishing`` must map REUSE_SATURATION hits to 1.0 so the ROI
+    layer's ``min(reuse_score, 1.0)`` cap aligns with the attribution
+    scale. A previous implementation divided by ``log1p(1)``, which
+    caused a single reuse hit to already saturate the reuse term."""
+    import math
+
+    from token_roi.attribution import _diminishing
+    from token_roi.roi import REUSE_SATURATION
+
+    assert _diminishing(0) == 0.0
+    # A single hit should NOT already be at the cap.
+    assert 0.0 < _diminishing(1) < 0.5
+    # Saturation point equals exactly 1.0.
+    assert _diminishing(REUSE_SATURATION) == pytest.approx(1.0)
+    # Monotonic, concave: per-hit marginal return strictly diminishes.
+    f1, f2, f5, f30 = _diminishing(1), _diminishing(2), _diminishing(5), _diminishing(30)
+    assert f1 < f2 < f5 < f30
+    slope_1_2 = f2 - f1
+    slope_5_30 = (f30 - f5) / (30 - 5)
+    assert slope_1_2 > slope_5_30
 
 
 def test_cross_session_reuse_upgrades_score(store, db):

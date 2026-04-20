@@ -78,6 +78,16 @@ token-roi init
 
 可选 extras：`otel`（OpenTelemetry 导出）、`anthropic`（Agent SDK 包装器）、`dev`（pytest）。
 
+### 支持的数据源
+
+`token-roi import <source>` 可从以下任意一种来源拉取会话历史：
+
+- **claude-code** — `~/.claude/projects/` 下的 JSONL，完整记录了 token 用量、工具调用与文件编辑事件，是参考实现。
+- **codex** — OpenAI Codex CLI 的会话日志（`~/.codex/sessions/`），将 `message` / `function_call` / `function_call_output` / `token_count` 映射为事件。各版本 schema 有差异，导入器对未知记录宽容跳过。
+- **cursor** — Cursor IDE 用户目录下 `state.vscdb` SQLite 中的聊天历史。**注意：** 除非你启用了 Cursor 的 API-key / OpenRouter 自带计费模式，Cursor 通常不会记录 token 用量，导入后的事件 token 计为 0。
+- **aider** — `.aider.chat.history.md` 会话文本，当同目录存在 `.aider.llm.history` 时自动补齐 token 数与模型名。带路径 info-string 的代码块会提升为 `FILE_WRITE` 事件。
+- **openai-jsonl** — 通用 OpenAI Responses API / Chat Completions JSONL 日志；按行读取 `input` / `output` / `usage` 并生成对应的用户 / 助手 / 工具调用事件。
+
 ---
 
 ## 个人审计 — 快速开始
@@ -86,6 +96,11 @@ token-roi init
 
 ```bash
 token-roi import claude-code                    # 拉取 ~/.claude/projects/*/*.jsonl
+# 也支持：
+# token-roi import codex                          # OpenAI Codex CLI（~/.codex/sessions）
+# token-roi import cursor                         # Cursor IDE 聊天历史
+# token-roi import aider --from ~/projects        # Aider .aider.chat.history.md
+# token-roi import openai-jsonl --from log.jsonl
 token-roi score                                  # 归因 + ROI 分类器
 token-roi judge --model zai-org/glm-4.7-flash    # 每条 prompt 的本地 LLM 判定
 token-roi name-sessions                          # 给会话起一个人类可读的短名字
