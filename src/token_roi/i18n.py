@@ -242,6 +242,8 @@ _CATALOG: dict[str, dict[str, str]] = {
         "team.leaderboard_filtered_by":   "filtering",
         "team.leaderboard_clear_filter":  "clear filter",
         "team.leaderboard_no_sessions_in_class": "no sessions in this category",
+        "team.platform_mix":           "what the team used",
+        "team.platform_mix_sub":       "spend per platform (Claude Code, Cursor, …)",
 
         # ---- projects view ----
         "projects.heading":         "Projects",
@@ -252,7 +254,9 @@ _CATALOG: dict[str, dict[str, str]] = {
         "projects.cost_per_kb":     "cost per KB",
         "projects.roi_mix":         "outcome mix",
         "projects.model_mix":       "model mix",
+        "projects.platform_mix":    "platform mix",
         "projects.description":     "what this project is",
+        "platform.empty":           "no platform data yet — re-run `token-roi import` to tag sessions.",
 
         # ---- employees view ----
         "employees.heading":           "Employees",
@@ -488,6 +492,8 @@ _CATALOG: dict[str, dict[str, str]] = {
         "team.leaderboard_filtered_by":   "已筛选",
         "team.leaderboard_clear_filter":  "清除筛选",
         "team.leaderboard_no_sessions_in_class": "该分类下暂无会话",
+        "team.platform_mix":           "团队使用的平台",
+        "team.platform_mix_sub":       "按平台分开的花费（Claude Code、Cursor 等）",
 
         # ---- projects view ----
         "projects.heading":         "项目",
@@ -498,7 +504,9 @@ _CATALOG: dict[str, dict[str, str]] = {
         "projects.cost_per_kb":     "每 KB 花费",
         "projects.roi_mix":         "产出分布",
         "projects.model_mix":       "模型构成",
+        "projects.platform_mix":    "平台构成",
         "projects.description":     "项目简介",
+        "platform.empty":           "暂无平台数据 —— 重新运行 `token-roi import` 以为会话打标签。",
 
         # ---- employees view ----
         "employees.heading":           "员工",

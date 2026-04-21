@@ -81,6 +81,15 @@ class CodexImporter(Importer):
                 log.warning("skip malformed line %s:%d: %s", path, pos, e)
                 stats.skipped += 1
 
+        # Codex Desktop v0.107+ writes rollouts with a nested envelope
+        # ({type:"response_item", payload:{type:"message", ...}}) and moves
+        # token counts from a top-level `token_count` record to
+        # event_msg.payload.type == "token_count". Flatten these into the
+        # older CLI shape so the walker below stays simple, and reorder so
+        # token_count sits BEFORE the assistant message it pairs with
+        # (the old CLI put it before; the new app emits it after).
+        records = _normalize_codex_records(records)
+
         # Extract cwd from first record that carries it.
         project_slug = "codex-session"
         for r in records:
@@ -94,7 +103,10 @@ class CodexImporter(Importer):
             employee_id = self.employees.resolve_for_slug(project_slug).id
         if self.db is not None:
             self.db.upsert_session_metadata(
-                session_id, project_slug=project_slug, employee_id=employee_id,
+                session_id,
+                project_slug=project_slug,
+                employee_id=employee_id,
+                platform=self.source_name,
             )
 
         # Walk records, tracking nearest preceding token_count and open
@@ -288,3 +300,145 @@ def _truncate(v: object, n: int = 4096) -> object:
     if isinstance(v, str) and len(v) > n:
         return v[:n] + f"... [truncated {len(v) - n} chars]"
     return v
+
+
+# Record-type keys that are UNIQUE to the Codex Desktop v0.107+ envelope
+# format. If any of these appear, we flatten + reorder the whole file;
+# otherwise we pass records through untouched. ``session_meta`` is NOT in
+# this set because the old Codex CLI also used that type name (but with
+# ``cwd`` at top level rather than under ``payload``), and we shouldn't
+# normalize old-format files just because they opened with session_meta.
+_NEW_ENVELOPE_ONLY_TYPES = {"response_item", "event_msg", "turn_context"}
+# All types the normalizer knows how to transform — used inside the loop
+# to decide whether a record goes through flattening or straight through.
+_NEW_ENVELOPE_TYPES = _NEW_ENVELOPE_ONLY_TYPES | {"session_meta"}
+
+
+def _normalize_codex_records(records: list[dict]) -> list[dict]:
+    """Flatten Codex Desktop v0.107+ envelope records into the flat
+    shape the older CLI produced, then reorder ``token_count`` records to
+    sit BEFORE the assistant message they describe.
+
+    Mapping:
+      {type:"session_meta", payload:{cwd}}            -> {type:"session_meta", cwd}
+      {type:"response_item", payload:{type:"message", role, content}}
+                                                      -> {type:"message", role, content}
+      {type:"response_item", payload:{type:"function_call", name, arguments, call_id}}
+                                                      -> {type:"function_call", name, arguments, call_id}
+      {type:"response_item", payload:{type:"function_call_output", call_id, output}}
+                                                      -> {type:"function_call_output", call_id, output}
+      {type:"event_msg", payload:{type:"token_count", info:{last_token_usage:{...}}}}
+                                                      -> {type:"token_count", input_tokens, output_tokens, cached_input_tokens, model}
+      {type:"turn_context", payload:{model}}          -> model captured and attached to next token_count
+      Everything else (event_msg user_message/agent_message/task_*, response_item reasoning,
+      Cursor-style event_msg.task_complete) is dropped as a duplicate / metadata.
+    """
+    if not any(r.get("type") in _NEW_ENVELOPE_ONLY_TYPES for r in records):
+        return records
+
+    flat: list[dict] = []
+    current_model: str | None = None
+    for rec in records:
+        t = rec.get("type")
+        ts = rec.get("timestamp")
+        p = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
+
+        # Old-format records (mixed files can happen) pass through.
+        if t not in _NEW_ENVELOPE_TYPES:
+            flat.append(rec)
+            continue
+
+        if t == "session_meta":
+            out = {"type": "session_meta", "timestamp": ts}
+            for k in ("cwd", "id"):
+                if k in p:
+                    out[k] = p[k]
+            flat.append(out)
+            continue
+
+        if t == "turn_context":
+            # No emitted event — just capture the active model for the
+            # next token_count record that arrives.
+            m = p.get("model")
+            if m:
+                current_model = m
+            continue
+
+        if t == "response_item":
+            pt = p.get("type")
+            if pt == "message":
+                flat.append({
+                    "type": "message", "timestamp": ts,
+                    "role": p.get("role"),
+                    "content": p.get("content"),
+                })
+            elif pt == "function_call":
+                flat.append({
+                    "type": "function_call", "timestamp": ts,
+                    "name": p.get("name"),
+                    "arguments": p.get("arguments"),
+                    "call_id": p.get("call_id") or p.get("id") or "",
+                })
+            elif pt == "function_call_output":
+                flat.append({
+                    "type": "function_call_output", "timestamp": ts,
+                    "call_id": p.get("call_id") or p.get("id") or "",
+                    "output": p.get("output"),
+                    "is_error": bool(p.get("is_error")),
+                })
+            # `reasoning` type: skip — it duplicates agent_reasoning and
+            # carries no tokens we haven't already priced.
+            continue
+
+        if t == "event_msg":
+            pt = p.get("type")
+            if pt == "token_count":
+                info = p.get("info")
+                if isinstance(info, dict):
+                    usage = info.get("last_token_usage") or {}
+                    if usage:
+                        flat.append({
+                            "type": "token_count", "timestamp": ts,
+                            "input_tokens": int(usage.get("input_tokens") or 0),
+                            "output_tokens": int(usage.get("output_tokens") or 0),
+                            # reasoning_output_tokens is metadata about the
+                            # hidden reasoning tokens; OpenAI bills it as
+                            # output. If the usage record already rolls it
+                            # into output_tokens (it does in practice), we
+                            # don't double-count.
+                            "cached_input_tokens": int(usage.get("cached_input_tokens") or 0),
+                            "model": current_model,
+                        })
+                # No usage info = rate-limit-only heartbeat; skip.
+            # user_message / agent_message / task_started / task_complete /
+            # agent_reasoning / context_compacted / turn_aborted: these are
+            # UI/timeline event summaries that duplicate the content already
+            # captured via response_item. Dropping them avoids double-counting.
+            continue
+
+    # Reorder: move each token_count record to sit BEFORE the most recent
+    # assistant message that preceded it. The old walker expects the
+    # token_count to have arrived first (it primes `pending_usage` before
+    # the message event consumes it); the new format emits the usage
+    # summary AFTER the turn finishes, so without this swap the cost
+    # would always attach to whatever assistant message comes NEXT, off
+    # by one turn.
+    reordered: list[dict] = []
+    for rec in flat:
+        if rec.get("type") == "token_count":
+            # Walk backwards from the tail of `reordered` to find the
+            # most recent assistant message that doesn't already have a
+            # token_count before it; insert in front of that message.
+            insert_at: int | None = None
+            for i in range(len(reordered) - 1, -1, -1):
+                r = reordered[i]
+                if r.get("type") == "token_count":
+                    break  # we hit a previous usage — don't cross it
+                if r.get("type") == "message" and r.get("role") == "assistant":
+                    insert_at = i
+                    break
+            if insert_at is not None:
+                reordered.insert(insert_at, rec)
+                continue
+        reordered.append(rec)
+    return reordered

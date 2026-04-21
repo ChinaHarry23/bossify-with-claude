@@ -137,6 +137,7 @@ class ClaudeCodeImporter(Importer):
                 session_id,
                 project_slug=project_slug,
                 employee_id=employee_id,
+                platform=self.source_name,
             )
 
         # First pass: read + parse + timestamp-sort. Claude Code writes in

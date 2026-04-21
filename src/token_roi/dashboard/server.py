@@ -161,6 +161,7 @@ def make_app(data_dir: Path):
                 "session_id":    sid,
                 "name":          name_info.get("name"),
                 "summary":       name_info.get("summary"),
+                "platform":      name_info.get("platform"),
                 "event_count":   t.event_count,
                 "prompts":       t.prompt_count,
                 "tools":         t.tool_call_count,
@@ -714,6 +715,14 @@ def make_app(data_dir: Path):
         total_kb = total_file_bytes / 1024.0
         cost_per_kb = (total_cost_usd / total_kb) if total_kb > 0 else None
 
+        # Platform mix: how the spend breaks down across Claude Code,
+        # Cursor, Codex, Aider, etc. The manager card shows "$120 on
+        # Claude Code · $40 on Cursor" so it's obvious which tool the
+        # team is actually using and where the money is going.
+        platforms = db.platform_breakdown()
+        for pl in platforms:
+            pl["formatted_cost"] = format_currency(pl["cost_usd"])
+
         return {
             "active_employees":      len(active),
             "total_employees":       len(employees),
@@ -730,6 +739,7 @@ def make_app(data_dir: Path):
             "waste_alerts":          waste_count,
             "roi_totals":            roi_totals,
             "top_waste_patterns":    db.team_waste_patterns(limit=10),
+            "platform_breakdown":    platforms,
         }
 
     @app.get("/api/employees")
@@ -812,6 +822,12 @@ def make_app(data_dir: Path):
             for m in models:
                 m["formatted_cost"] = format_currency(m["cost_usd"])
             r["model_breakdown"] = models
+            # Per-platform split so the card can show "Claude Code $90 ·
+            # Cursor $12" — answers "what tool did this project run on?"
+            platforms = db.platform_breakdown(project_slug=r["slug"])
+            for p in platforms:
+                p["formatted_cost"] = format_currency(p["cost_usd"])
+            r["platform_breakdown"] = platforms
         return rows
 
     @app.get("/api/projects/{slug}")
@@ -836,6 +852,10 @@ def make_app(data_dir: Path):
         for m in models:
             m["formatted_cost"] = format_currency(m["cost_usd"])
         rollup["model_breakdown"] = models
+        platforms = db.platform_breakdown(project_slug=slug)
+        for p in platforms:
+            p["formatted_cost"] = format_currency(p["cost_usd"])
+        rollup["platform_breakdown"] = platforms
         return rollup
 
     @app.get("/api/model-breakdown")

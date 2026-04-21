@@ -65,7 +65,10 @@ class OpenAIJsonlImporter(Importer):
             employee_id = self.employees.resolve_for_slug(project_slug).id
         if self.db is not None:
             self.db.upsert_session_metadata(
-                session_id, project_slug=project_slug, employee_id=employee_id,
+                session_id,
+                project_slug=project_slug,
+                employee_id=employee_id,
+                platform=self.source_name,
             )
 
         # Track open function_calls by call_id so subsequent lines'

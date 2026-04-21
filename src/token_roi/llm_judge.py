@@ -743,6 +743,9 @@ class Judge:
         *,
         file_root: Path | None = None,
         locale: str | None = None,
+        temperature: float = 0.0,
+        max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+        use_json_schema: bool = True,
     ):
         self.db = db
         self.llm = llm
@@ -753,12 +756,20 @@ class Judge:
         # Locale drives which system prompt variant is sent to the LLM —
         # Chinese for management audit contexts, English for developers.
         self.locale = locale or get_locale()
+        # Sampling knobs. Default is temperature=0 + hard JSON schema, which
+        # is what a disciplined instruction-tuned model wants. Some local
+        # models (notably certain Gemma builds) collapse into token
+        # repetition under that combo; raising temperature a touch and/or
+        # dropping the schema constraint is the standard workaround.
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.use_json_schema = use_json_schema
 
     # ---- discovery ----
 
     def prompts_needing_judgment(
         self, *, session_id: str | None = None, since_ts: float | None = None,
-        force: bool = False,
+        force: bool = False, platform: str | None = None,
     ) -> list[sqlite3.Row]:
         """Un-judged real user prompts in deterministic order.
 
@@ -768,6 +779,12 @@ class Judge:
         ``token-roi judge`` regenerates the reasoning / wasteful-pattern
         strings in the right language.
 
+        ``platform`` restricts to sessions imported from a specific tool
+        (``claude-code`` / ``cursor`` / ``codex`` / …). This is what
+        ``token-roi nuclear`` uses to judge each platform in its own
+        progress block so the boss can see "Claude Code: 30 prompts,
+        Cursor: 5 prompts" instead of one unified counter.
+
         Also filters out synthetic prompts (slash-command wrappers,
         post-compaction restarts, task notifications) — those carry no
         intent and shouldn't consume LLM judge time. Already-imported
@@ -775,6 +792,10 @@ class Judge:
         """
         where = ["e.type = 'user_prompt'"]
         args: list = []
+        join_summaries = ""
+        if platform is not None:
+            join_summaries = "JOIN session_summaries s ON s.session_id = e.session_id"
+            where.append("s.platform = ?"); args.append(platform)
         if session_id:
             where.append("e.session_id = ?"); args.append(session_id)
         if since_ts is not None:
@@ -786,6 +807,7 @@ class Judge:
             SELECT e.id, e.session_id, e.ts, e.payload_json
             FROM events e
             LEFT JOIN llm_judgments j ON j.prompt_event_id = e.id
+            {join_summaries}
             WHERE {" AND ".join(where)}
             ORDER BY e.ts ASC
         """
@@ -959,9 +981,9 @@ class Judge:
                 {"role": "system", "content": _judge_system_prompt(self.locale)},
                 {"role": "user",   "content": user_msg},
             ],
-            temperature=0.0,
-            max_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
-            response_format=JUDGMENT_RESPONSE_FORMAT,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            response_format=JUDGMENT_RESPONSE_FORMAT if self.use_json_schema else None,
         )
         parsed = _parse_judgment_json(resp.text)
         # Normalize the "no code was produced" case back to None so
@@ -1368,10 +1390,12 @@ class Judge:
         limit: int | None = None,
         force: bool = False,
         progress: bool = True,
+        platform: str | None = None,
     ) -> Iterator[Judgment]:
         """Iterate over un-judged prompts, judging each one."""
         rows = self.prompts_needing_judgment(
             session_id=session_id, since_ts=since_ts, force=force,
+            platform=platform,
         )
         if limit is not None:
             rows = rows[:limit]
@@ -1462,6 +1486,42 @@ def _bounded_or_none(v) -> float | None:
     return max(0.0, min(1.0, f))
 
 
+def _normalize_judgment_keys(parsed: dict) -> dict:
+    """Accept common field-name variants from models that drift from the
+    exact schema.
+
+    Required whenever ``--no-json-schema`` is used (no grammar to lock
+    the names) or when LM Studio silently disables constrained decoding
+    for a model family it can't grammar-match. Without this, Gemma-style
+    output with ``"meaningful_value": 0.8`` parses into a 0.0 score and
+    wrecks the classification.
+
+    Only fills in a canonical key if it's missing — explicit schema output
+    still wins.
+    """
+    if not isinstance(parsed, dict):
+        return parsed
+    aliases = {
+        # Missing the "_score" suffix (Gemma, some Qwen variants).
+        "meaningful_value":       "meaningful_value_score",
+        "meaningful":             "meaningful_value_score",
+        "value_score":            "meaningful_value_score",
+        "code_quality":           "code_quality_score",
+        "quality_score":          "code_quality_score",
+        # Verbose paraphrases seen in practice.
+        "durability":             "output_durability",
+        "durable_output":         "output_durability",
+        "wasteful":               "wasteful_patterns",
+        "waste_patterns":         "wasteful_patterns",
+        "explanation":            "reasoning",
+        "rationale":              "reasoning",
+    }
+    for src, dst in aliases.items():
+        if dst not in parsed and src in parsed:
+            parsed[dst] = parsed[src]
+    return parsed
+
+
 def _parse_judgment_json(text: str) -> dict:
     """Best-effort JSON extraction from an LLM response.
 
@@ -1477,7 +1537,7 @@ def _parse_judgment_json(text: str) -> dict:
             t = t[4:]
     # Fast path: whole string is JSON.
     try:
-        return json.loads(t)
+        return _normalize_judgment_keys(json.loads(t))
     except json.JSONDecodeError:
         pass
     # Fallback: find the first balanced brace region.
@@ -1509,4 +1569,4 @@ def _parse_judgment_json(text: str) -> dict:
                 break
     if end < 0:
         raise ValueError(f"unterminated JSON in LLM output: {text[:200]!r}")
-    return json.loads(t[start:end + 1])
+    return _normalize_judgment_keys(json.loads(t[start:end + 1]))

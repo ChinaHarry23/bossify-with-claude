@@ -64,10 +64,54 @@ async function loadTeamView() {
     renderTeamKpis(team);
     renderTeamRoi(team);
     renderTeamWaste(team);
+    renderTeamPlatformMix(team);
     await renderTeamLeaderboard();
   } catch (e) {
     console.error("team view load failed", e);
   }
+}
+
+// Short display label for a platform id. Keeps the raw id ("claude-code")
+// as a tooltip on the chip; the shown text is a human-friendly name.
+function platformLabel(id) {
+  if (!id) return "—";
+  const s = String(id).toLowerCase();
+  const map = {
+    "claude-code":  "Claude Code",
+    "cursor":       "Cursor",
+    "codex":        "Codex",
+    "aider":        "Aider",
+    "openai-jsonl": "OpenAI JSONL",
+  };
+  return map[s] || id;
+}
+
+// Row of platform chips: one pill per source (Claude Code, Cursor, …)
+// showing USD cost, session count, and % of total. Same visual language
+// as renderModelMix so the two rows stack cleanly on the same card.
+function renderPlatformMix(platforms) {
+  if (!platforms || !platforms.length) {
+    return `<div class="muted tiny">${T("platform.empty")}</div>`;
+  }
+  const total = platforms.reduce((a, p) => a + (p.cost_usd || 0), 0);
+  return `<div class="platform-mix">
+    ${platforms.map((p) => {
+      const pct = total > 0 ? (p.cost_usd / total) * 100 : 0;
+      const sessLabel = T("projects.sessions");
+      return `<span class="platform-chip" title="${escapeHtml(p.platform || "")}">
+        <b>${escapeHtml(platformLabel(p.platform))}</b>
+        <span class="muted"> ${escapeHtml(p.formatted_cost || "—")}</span>
+        <span class="muted tiny"> · ${fmt(p.sessions || 0)} ${sessLabel}</span>
+        <span class="muted tiny"> · ${pct.toFixed(0)}%</span>
+      </span>`;
+    }).join("")}
+  </div>`;
+}
+
+function renderTeamPlatformMix(team) {
+  const box = document.getElementById("team-platform-mix");
+  if (!box) return;
+  box.innerHTML = renderPlatformMix(team.platform_breakdown || []);
 }
 
 function renderTeamKpis(team) {
@@ -488,6 +532,10 @@ function renderProjectCard(p) {
       </div>
     </div>
     <div>
+      <div class="emp-waste-head">${T("projects.platform_mix")}</div>
+      ${renderPlatformMix(p.platform_breakdown)}
+    </div>
+    <div>
       <div class="emp-waste-head">${T("projects.model_mix")}</div>
       ${renderModelMix(p.model_breakdown)}
     </div>
@@ -509,9 +557,13 @@ async function openProjectDetail(slug) {
     modal.open();
     const sessionRows = (det.sessions || []).map((s) => {
       const cls = s.roi_class ? T("roi." + s.roi_class) : T("modal.unscored");
+      const platBadge = s.platform
+        ? `<span class="platform-badge" title="${escapeHtml(s.platform)}">${escapeHtml(platformLabel(s.platform))}</span>`
+        : "";
       return `<div class="row emp-session-row"
                    data-session-id="${escapeHtml(s.session_id)}">
         <div class="path"><b>${escapeHtml(s.name || s.session_id.slice(0, 12))}</b>
+          ${platBadge}
           <span class="muted"> · ${escapeHtml((s.summary || "").slice(0, 140))}</span></div>
         <div><b>${escapeHtml(s.formatted_cost || "—")}</b>
           <span class="muted tiny"> · ${fmtCompact(s.total_tokens || 0)}</span>
@@ -532,6 +584,10 @@ async function openProjectDetail(slug) {
           <div class="metric"><div class="label">${T("projects.sessions")}</div><div class="value">${fmt(det.session_count)}</div></div>
           <div class="metric"><div class="label">${T("projects.durable_bytes")}</div><div class="value">${fmtCompact(det.file_bytes || 0)}</div></div>
         </div>
+      </div>
+      <div>
+        <div class="section-h">${T("projects.platform_mix")}</div>
+        ${renderPlatformMix(det.platform_breakdown)}
       </div>
       <div>
         <div class="section-h">${T("projects.model_mix")}</div>

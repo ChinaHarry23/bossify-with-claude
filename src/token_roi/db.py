@@ -332,6 +332,20 @@ class AnalyticsDB:
         # ALTER when needed. Idempotent.
         self._ensure_column("session_summaries", "project_slug", "TEXT")
         self._ensure_column("session_summaries", "employee_id",  "TEXT")
+        # Which external tool produced the session: claude-code, cursor,
+        # codex, aider, openai-jsonl. Populated by each importer via
+        # upsert_session_metadata so the dashboard can break spend down by
+        # platform per project and across the team.
+        added_platform = not self._column_exists("session_summaries", "platform")
+        self._ensure_column("session_summaries", "platform", "TEXT")
+        if added_platform:
+            # Every pre-existing row was imported by the only source that
+            # used to exist (claude-code). Tag them so legacy data shows up
+            # under the right platform bucket; fresh imports will overwrite.
+            self._conn.execute(
+                "UPDATE session_summaries SET platform = 'claude-code' "
+                "WHERE platform IS NULL"
+            )
         # Cross-turn durable propagation (see attribution._propagate_durable).
         # A review prompt with no direct artefact gets a decayed share
         # of the next prompt's durable bytes, so the boss view doesn't
@@ -358,6 +372,10 @@ class AnalyticsDB:
         if any(r["name"] == column for r in rows):
             return
         self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+
+    def _column_exists(self, table: str, column: str) -> bool:
+        rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(r["name"] == column for r in rows)
 
     # ---- ingest ----
 
@@ -658,10 +676,15 @@ class AnalyticsDB:
         *,
         project_slug: str | None = None,
         employee_id: str | None = None,
+        platform: str | None = None,
     ) -> None:
-        """Populate project_slug/employee_id without overwriting an existing
-        LLM-generated name or summary. Called from the importer once per
-        ingested JSONL file, well before `token-roi name-sessions` runs.
+        """Populate project_slug/employee_id/platform without overwriting an
+        existing LLM-generated name or summary. Called from the importer once
+        per ingested session, well before `token-roi name-sessions` runs.
+
+        ``platform`` is the short source name ("claude-code", "cursor",
+        "codex", "aider", "openai-jsonl") — the same string the importer
+        registers under — so the dashboard can break spend down per tool.
         """
         existing = self._conn.execute(
             """SELECT name, summary, model, generated_at
@@ -676,30 +699,35 @@ class AnalyticsDB:
                 """
                 INSERT OR REPLACE INTO session_summaries
                     (session_id, name, summary, model, generated_at,
-                     project_slug, employee_id)
-                VALUES (?, '', '', 'metadata-only', ?, ?, ?)
+                     project_slug, employee_id, platform)
+                VALUES (?, '', '', 'metadata-only', ?, ?, ?, ?)
                 """,
-                (session_id, _time.time(), project_slug, employee_id),
+                (session_id, _time.time(), project_slug, employee_id, platform),
             )
         else:
+            # Re-imports OVERWRITE platform (the session really is from this
+            # tool now), while COALESCE keeps project_slug/employee_id sticky
+            # if the new caller passed None.
             self._conn.execute(
                 """UPDATE session_summaries
                       SET project_slug = COALESCE(?, project_slug),
-                          employee_id  = COALESCE(?, employee_id)
+                          employee_id  = COALESCE(?, employee_id),
+                          platform     = COALESCE(?, platform)
                     WHERE session_id = ?""",
-                (project_slug, employee_id, session_id),
+                (project_slug, employee_id, platform, session_id),
             )
 
     def session_names(self) -> dict[str, dict]:
-        """Return {session_id: {name, summary, model}} for every named session."""
+        """Return {session_id: {name, summary, model, platform}} for every named session."""
         rows = self._conn.execute(
-            """SELECT session_id, name, summary, model FROM session_summaries"""
+            """SELECT session_id, name, summary, model, platform FROM session_summaries"""
         ).fetchall()
         return {
             r["session_id"]: {
-                "name":    r["name"],
-                "summary": r["summary"],
-                "model":   r["model"],
+                "name":     r["name"],
+                "summary":  r["summary"],
+                "model":    r["model"],
+                "platform": r["platform"],
             }
             for r in rows
         }
@@ -999,7 +1027,7 @@ class AnalyticsDB:
         from .pricing import calculate_usd_cost, lookup_pricing
 
         session_rows = self._conn.execute(
-            """SELECT session_id, name, summary
+            """SELECT session_id, name, summary, platform
                  FROM session_summaries
                 WHERE project_slug = ?""",
             (project_slug,),
@@ -1071,6 +1099,7 @@ class AnalyticsDB:
                 "session_id":   sid,
                 "name":         r["name"] or "",
                 "summary":      r["summary"] or "",
+                "platform":     r["platform"],
                 "cost_usd":     t.get("cost_usd", 0.0),
                 "total_tokens": t.get("total_tokens", 0),
                 "events":       t.get("events", 0),
@@ -1345,6 +1374,94 @@ class AnalyticsDB:
     def total_cost(self) -> float:
         """Sum of USD cost across every session."""
         return sum(self.session_cost_map().values())
+
+    def platform_breakdown(self, *, project_slug: str | None = None) -> list[dict]:
+        """Per-platform token + USD + session-count breakdown.
+
+        Scope is either one project slug, or (None) the whole workspace.
+        Sessions carry their ``platform`` tag in ``session_summaries``
+        (set by the importer); events join through ``session_id``. This is
+        the data behind "what did the team use on what tool, and what did
+        each cost" on the manager dashboard, and the per-project
+        equivalent on the project drill-down.
+        """
+        from .pricing import calculate_usd_cost, lookup_pricing
+
+        where = ["s.platform IS NOT NULL"]
+        args: list = []
+        if project_slug is not None:
+            where.append("s.project_slug = ?")
+            args.append(project_slug)
+        where_sql = "WHERE " + " AND ".join(where)
+
+        # Model-aware: price each (platform, model) bucket with the right
+        # rate card, then sum back up per platform so Opus-on-Cursor costs
+        # what Opus costs, not what Sonnet costs.
+        rows = self._conn.execute(
+            f"""SELECT s.platform                    AS platform,
+                       e.model                        AS model,
+                       SUM(e.tokens_in)               AS tokens_in,
+                       SUM(e.tokens_out)              AS tokens_out,
+                       SUM(e.cached_tokens)           AS cache_read,
+                       SUM(e.cache_creation_tokens)   AS cache_create,
+                       SUM(e.total_tokens)            AS total_tokens,
+                       COUNT(DISTINCT e.session_id)   AS sessions,
+                       COUNT(*)                       AS events
+                  FROM events e
+                  JOIN session_summaries s ON s.session_id = e.session_id
+                 {where_sql}
+                 GROUP BY s.platform, e.model""",
+            args,
+        ).fetchall()
+
+        by_platform: dict[str, dict] = {}
+        for r in rows:
+            plat = r["platform"]
+            bucket = by_platform.setdefault(plat, {
+                "platform":     plat,
+                "sessions":     0,
+                "events":       0,
+                "tokens_in":    0,
+                "tokens_out":   0,
+                "cache_read":   0,
+                "cache_create": 0,
+                "total_tokens": 0,
+                "cost_usd":     0.0,
+            })
+            p = lookup_pricing(r["model"])
+            bucket["events"]       += r["events"] or 0
+            bucket["tokens_in"]    += r["tokens_in"] or 0
+            bucket["tokens_out"]   += r["tokens_out"] or 0
+            bucket["cache_read"]   += r["cache_read"] or 0
+            bucket["cache_create"] += r["cache_create"] or 0
+            bucket["total_tokens"] += r["total_tokens"] or 0
+            bucket["cost_usd"]     += calculate_usd_cost(
+                r["tokens_in"] or 0, r["tokens_out"] or 0,
+                r["cache_read"] or 0, r["cache_create"] or 0,
+                pricing=p,
+            )
+
+        # Distinct session count per platform (events may span multiple
+        # models per session, so SUM of per-model COUNT(DISTINCT) above is
+        # inflated; re-query once, cheaply, without the model split).
+        sess_where = ["s.platform IS NOT NULL"]
+        sess_args: list = []
+        if project_slug is not None:
+            sess_where.append("s.project_slug = ?")
+            sess_args.append(project_slug)
+        for r in self._conn.execute(
+            f"""SELECT platform, COUNT(*) AS n
+                  FROM session_summaries s
+                 WHERE {" AND ".join(sess_where)}
+                 GROUP BY platform""",
+            sess_args,
+        ).fetchall():
+            if r["platform"] in by_platform:
+                by_platform[r["platform"]]["sessions"] = r["n"] or 0
+
+        out = list(by_platform.values())
+        out.sort(key=lambda d: (-d["cost_usd"], d["platform"]))
+        return out
 
     def model_breakdown(self, *, session_ids: list[str] | None = None,
                         project_slug: str | None = None) -> list[dict]:

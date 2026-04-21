@@ -86,6 +86,7 @@ def _ensure_loaded() -> None:
         "claude_code",
         "codex",
         "cursor",
+        "cursor_usage",
         "aider",
         "openai_jsonl",
     ):

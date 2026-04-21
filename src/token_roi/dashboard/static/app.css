@@ -268,6 +268,43 @@ html, body {
   white-space: nowrap;
 }
 
+/* Platform-mix chip row. One pill per tool (Claude Code, Cursor, …).
+   Visually distinct from model chips (accent-tinted border) because
+   this answers a different question — "which tool did the work" vs
+   "which model priced it". */
+.platform-mix-wrap {
+  padding: 4px 2px;
+}
+.platform-mix {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.platform-chip {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 3px 10px;
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  background: rgba(100, 120, 255, 0.06);
+  white-space: nowrap;
+}
+/* Inline per-session badge in project-detail session rows. Smaller and
+   quieter than the chip, because the row already has a dominant cost
+   figure — this just flags "this session was Cursor". */
+.platform-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.02);
+  vertical-align: middle;
+}
+
 /* Sort-pill toggle inside the section header. One pill per sort key;
    the active one is highlighted via the same accent as the rest of
    the dashboard so the choice is visible at a glance. */

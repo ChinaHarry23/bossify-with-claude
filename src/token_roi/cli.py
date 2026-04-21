@@ -202,8 +202,9 @@ def build_parser() -> argparse.ArgumentParser:
     # nuclear — wipe derived data and re-run the whole pipeline.
     s = sub.add_parser(
         "nuclear",
-        help="Wipe all derived state and re-run the whole pipeline. "
-             "Preserves employees.json and your raw Claude Code history.",
+        help="Wipe all derived state and re-run the whole pipeline across "
+             "every configured platform (Claude Code, Cursor, Codex). "
+             "Preserves employees.json and your raw tool histories.",
     )
     s.add_argument("--yes", action="store_true",
                    help="Skip the 'are you sure?' prompt.")
@@ -219,6 +220,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "smoke-testing the import + score plumbing).")
     s.add_argument("--skip-name", action="store_true",
                    help="Skip the `name-sessions` and `name-projects` steps.")
+    s.add_argument("--platforms", type=str,
+                   default="claude-code,cursor,cursor-usage,codex",
+                   help="Comma-separated list of importers to sweep. Default "
+                        "is claude-code,cursor,cursor-usage,codex. Each runs "
+                        "with --optional, so missing sources are skipped "
+                        "silently. `cursor-usage` reads the CSV exported "
+                        "from cursor.com — the only way to get real token "
+                        "counts for Cursor subscription users.")
+    s.add_argument("--temperature", type=float, default=0.0,
+                   help="Forwarded to each per-platform judge call.")
+    s.add_argument("--max-tokens", type=int, default=None,
+                   help="Forwarded to each per-platform judge call.")
+    s.add_argument("--no-json-schema", action="store_true",
+                   help="Forwarded to each per-platform judge call.")
     s.set_defaults(func=cmd_nuclear)
 
     # judge
@@ -242,6 +257,23 @@ def build_parser() -> argparse.ArgumentParser:
                    help="List models available at the endpoint and exit.")
     s.add_argument("--timeout", type=int, default=120,
                    help="Per-call HTTP timeout in seconds.")
+    s.add_argument("--temperature", type=float, default=0.0,
+                   help="Sampling temperature. Default 0.0. Raise to ~0.4 "
+                        "when a local model collapses into token repetition.")
+    s.add_argument("--max-tokens", type=int, default=None,
+                   help="Max tokens in each judge reply. Default 1200 — "
+                        "raise if a verbose model truncates its JSON.")
+    s.add_argument("--no-json-schema", action="store_true",
+                   help="Disable constrained JSON-schema decoding. Use when "
+                        "a model (e.g. some Gemma builds) misbehaves under "
+                        "schema constraint; the prompt alone will shape the "
+                        "JSON.")
+    s.add_argument("--platform", type=str, default=None,
+                   help="Only judge prompts from sessions imported via this "
+                        "source (claude-code / cursor / codex / aider / "
+                        "openai-jsonl). Use this to judge one tool at a "
+                        "time — `token-roi nuclear` calls judge once per "
+                        "platform so each has its own progress block.")
     s.set_defaults(func=cmd_judge)
 
     # import
@@ -258,6 +290,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "Defaults to the importer's canonical location.")
     s.add_argument("--project", type=str, default=None,
                    help="Filter by project slug substring (e.g. 'Bossify').")
+    s.add_argument("--optional", action="store_true",
+                   help="Exit 0 with a note if the source has no data on "
+                        "disk, instead of erroring. Used by `nuclear` to "
+                        "sweep every known platform without failing on the "
+                        "ones the user doesn't have installed.")
     s.set_defaults(func=cmd_import)
 
     # dashboard
@@ -650,7 +687,14 @@ def cmd_nuclear(args) -> int:
 
     Use this when the derived data is in a state you can't recover from
     incrementally. For routine refresh after new sessions, prefer
-    ``token-roi import claude-code && token-roi score``.
+    ``token-roi import <platform> && token-roi score``.
+
+    The sweep imports from every platform listed in ``--platforms``
+    (default: ``claude-code,cursor,codex``). Each import is optional —
+    platforms the user doesn't have installed are skipped silently. The
+    judge step then runs once per platform so the progress output
+    separates "claude-code prompts" from "cursor prompts" and the two
+    show up independently on the manager dashboard.
     """
     import shutil
     import subprocess
@@ -704,6 +748,17 @@ def cmd_nuclear(args) -> int:
             out += ["--timeout", str(args.timeout)]
         return out
 
+    def judge_args() -> list[str]:
+        """Judge-specific flags (sampling + schema knobs) on top of llm_args."""
+        out = llm_args()
+        if args.temperature != 0.0:
+            out += ["--temperature", str(args.temperature)]
+        if args.max_tokens is not None:
+            out += ["--max-tokens", str(args.max_tokens)]
+        if args.no_json_schema:
+            out += ["--no-json-schema"]
+        return out
+
     def run(label: str, *subcmd: str) -> int:
         cmd = [sys.executable, "-m", "token_roi.cli"]
         if getattr(args, "locale", None):
@@ -726,18 +781,31 @@ def cmd_nuclear(args) -> int:
         shutil.copy(backup_path, employees_path)
         print(f"✓ restored {employees_path}")
 
-    # 3. Import Claude Code history from ~/.claude/projects/.
-    if (rc := run("import claude-code", "import", "claude-code")) != 0:
-        return rc
+    # 3. Import history from every configured platform. Each import is
+    #    --optional, so a platform the user doesn't use silently returns 0
+    #    with a short note instead of halting the whole pipeline. The
+    #    session_summaries.platform column this populates is what drives
+    #    per-platform breakdowns on the manager dashboard.
+    platforms = [p.strip() for p in args.platforms.split(",") if p.strip()]
+    for plat in platforms:
+        if (rc := run(f"import {plat}", "import", plat, "--optional")) != 0:
+            return rc
 
     # 4. First score pass — attribution + pure-math classification.
     if (rc := run("score (pre-judge)", "score")) != 0:
         return rc
 
-    # 5. LLM judge — the long pole (~20-30s per prompt).
+    # 5. LLM judge, run ONCE PER PLATFORM. Each invocation gets its own
+    #    progress block so the boss sees "judging claude-code: 30 prompts,
+    #    judging cursor: 5 prompts" instead of one undifferentiated
+    #    counter. Same model/endpoint is used across the board; pass
+    #    --temperature / --no-json-schema via nuclear flags if a local
+    #    model needs them.
     if not args.skip_judge:
-        if (rc := run("judge", "judge", *llm_args())) != 0:
-            return rc
+        for plat in platforms:
+            label = f"judge {plat}"
+            if (rc := run(label, "judge", "--platform", plat, *judge_args())) != 0:
+                return rc
         # 6. Second score pass folds LLM verdicts into the final class.
         if (rc := run("score (post-judge)", "score")) != 0:
             return rc
@@ -802,7 +870,13 @@ def cmd_judge(args) -> int:
               "Is LM Studio / Ollama running?", file=sys.stderr)
         return 2
 
-    judge = Judge(db, llm)
+    from .llm_judge import DEFAULT_MAX_OUTPUT_TOKENS
+    judge = Judge(
+        db, llm,
+        temperature=args.temperature,
+        max_tokens=args.max_tokens if args.max_tokens is not None else DEFAULT_MAX_OUTPUT_TOKENS,
+        use_json_schema=not args.no_json_schema,
+    )
     n = 0
     for j in judge.judge_all(
         session_id=args.session,
@@ -810,6 +884,7 @@ def cmd_judge(args) -> int:
         limit=args.limit,
         force=args.force,
         progress=True,
+        platform=args.platform,
     ):
         n += 1
     summary = db.llm_judgments_summary()
@@ -833,7 +908,16 @@ def cmd_import(args) -> int:
     registry = EmployeeRegistry(args.data_dir)
     imp = get_importer(args.source, store, db=db, employees=registry)
     path = args.from_path or imp.default_path()
-    stats = imp.import_path(path, project_filter=args.project)
+    try:
+        stats = imp.import_path(path, project_filter=args.project)
+    except FileNotFoundError as e:
+        # Optional mode: the source just isn't on this machine — not a
+        # failure, just skip. Nuclear uses this to sweep every known
+        # platform without breaking on the ones the user hasn't used.
+        if args.optional:
+            print(f"no {args.source} history at {path} — skipping.")
+            return 0
+        raise
     print(json.dumps(stats.to_dict(), indent=2))
     db.rebuild_from(store.iter_all_sessions())
     print(f"indexed {len(store.list_sessions())} session(s) after import.")
