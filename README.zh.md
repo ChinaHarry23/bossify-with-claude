@@ -4,7 +4,7 @@
 
 > *"你们搞 AI 的天天说 agentic coding 多便宜 —— 那为什么我的 token 账单看起来像一轮 A 轮融资？"*
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://python.org)
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-Skill-blueviolet)](https://claude.ai/code)
 [![Local-First](https://img.shields.io/badge/Local--First-100%25-brightgreen)](#)
@@ -26,7 +26,7 @@
 让本地 LLM **严格无情**地评判每一条 prompt<br>
 然后得到一个**敢点名的老板视角看板**
 
-[是什么](#是什么) · [安装](#安装) · [快速开始](#个人审计--快速开始) · [示例](#示例) · [评分原理](#评分原理) · [架构](#架构)
+[是什么](#是什么) · [安装](#安装) · [快速开始](#个人审计--快速开始) · [示例](#示例) · [评分原理](#评分原理) · [架构](#架构) · [引用](#如何引用)
 
 [**English README**](README.md)
 
@@ -248,6 +248,27 @@ pytest
 
 ---
 
+## 如何引用
+
+如果你在论文、学位论文、评测或产品中使用了 Bossify，请引用**本软件**。Apache-2.0 只授权代码的使用；学术署名靠引用。
+
+配套测量论文正在准备（暂定标题：*Token Capital Allocation in Agentic Software Engineering: An Explainable Attribution Model and Empirical Study*）。**论文有 DOI 或 arXiv 编号后，请改引（或同时引）那篇论文。** 此前请用：
+
+```bibtex
+@software{chinaharry_bossify_2026,
+  author       = {chinaharry},
+  title        = {Bossify: A Local-First Flight Recorder and {ROI} Analyzer for Agentic Coding Sessions},
+  year         = {2026},
+  version      = {0.1.0},
+  url          = {https://github.com/chinaharry/bossify-with-claude},
+  license      = {Apache-2.0}
+}
+```
+
+GitHub 的 “Cite this repository” 读取 [`CITATION.cff`](CITATION.cff)。软件与未发表手稿的 BibTeX 在 [`paper/bib/bossify.bib`](paper/bib/bossify.bib)。
+
+---
+
 ## 致谢
 
 作为 Claude Code 技能构建。Claude 自己看的入口是 [SKILL.md](SKILL.md)；这份 README 是给人（和老板）看的。灵感来源于一个观察：几乎每个团队都有那么几个"token 黑洞" —— 超长会话，产出为零，而且没人在衡量它们。直到现在。
@@ -256,7 +277,7 @@ pytest
 
 <div align="center">
 
-MIT License © [chinaharry](https://github.com/chinaharry)
+Apache License 2.0 © [chinaharry](https://github.com/chinaharry)
 
 *先把 vibe 量化，再开账单。*
 

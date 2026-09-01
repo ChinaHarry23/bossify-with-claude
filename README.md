@@ -4,7 +4,7 @@
 
 > *"You AI guys keep telling me agentic coding is cheap — then why does my token bill look like a Series A?"*
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://python.org)
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-Skill-blueviolet)](https://claude.ai/code)
 [![Local-First](https://img.shields.io/badge/Local--First-100%25-brightgreen)](#)
@@ -26,7 +26,7 @@ Point it at your team's `~/.claude/projects/`<br>
 let a local LLM judge every prompt *harshly*<br>
 and get a **boss-facing dashboard that names names**
 
-[What It Is](#what-it-is) · [Install](#install) · [Quick Start](#personal-audit--quick-start) · [Demo](#demo) · [How Scoring Works](#how-scoring-works) · [Architecture](#architecture)
+[What It Is](#what-it-is) · [Install](#install) · [Quick Start](#personal-audit--quick-start) · [Demo](#demo) · [How Scoring Works](#how-scoring-works) · [Architecture](#architecture) · [Cite](#citing-this-work)
 
 [**中文 README**](README.zh.md)
 
@@ -321,6 +321,27 @@ pytest
 
 ---
 
+## Citing this work
+
+If you use Bossify in a paper, thesis, benchmark, or product, please cite the **software**. That is how academic credit attaches to this repo; the Apache-2.0 licence only covers reuse of the code.
+
+A measurement paper is in preparation (working title: *Token Capital Allocation in Agentic Software Engineering: An Explainable Attribution Model and Empirical Study*). **Cite that paper instead of, or in addition to, the software once it has a DOI or arXiv id.** Until then, cite this:
+
+```bibtex
+@software{chinaharry_bossify_2026,
+  author       = {chinaharry},
+  title        = {Bossify: A Local-First Flight Recorder and {ROI} Analyzer for Agentic Coding Sessions},
+  year         = {2026},
+  version      = {0.1.0},
+  url          = {https://github.com/chinaharry/bossify-with-claude},
+  license      = {Apache-2.0}
+}
+```
+
+GitHub’s “Cite this repository” button reads [`CITATION.cff`](CITATION.cff). BibTeX for the software and the unpublished manuscript lives in [`paper/bib/bossify.bib`](paper/bib/bossify.bib).
+
+---
+
 ## Acknowledgement
 
 Built as a Claude Code skill. The entry point for Claude itself is [SKILL.md](SKILL.md); this README is for humans (and bosses). Inspired by the observation that every team has a few "token black holes" — long sessions that produce no durable output — and no one was measuring them. Until now.
@@ -329,7 +350,7 @@ Built as a Claude Code skill. The entry point for Claude itself is [SKILL.md](SK
 
 <div align="center">
 
-MIT License © [chinaharry](https://github.com/chinaharry)
+Apache License 2.0 © [chinaharry](https://github.com/chinaharry)
 
 *Measure the vibes. Then bill them.*
 

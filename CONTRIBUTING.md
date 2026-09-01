@@ -36,6 +36,10 @@ pytest
 - Keep the adversarial tone. Bossify is deliberately harsh; don't
   soften verdicts to be nice.
 
+## Citation
+
+If a change is used in a paper or product, cite Bossify via [`CITATION.cff`](CITATION.cff) (or `paper/bib/bossify.bib`). Pull requests are contributions under Apache-2.0.
+
 ## Philosophy
 
 If you're tempted to add a feature that makes scores *higher* on

@@ -8,13 +8,13 @@ version = "0.1.0"
 description = "新时代老板 (Bossify with Claude) — local-first flight recorder + ROI analyzer for agentic coding sessions."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 authors = [{ name = "bossify-with-claude" }]
 keywords = ["claude", "claude-code", "agents", "observability", "roi", "token-attribution"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: MIT License",
+  "License :: OSI Approved :: Apache Software License",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
@@ -51,6 +51,8 @@ dev = [
 token-roi = "token_roi.cli:main"
 
 [project.urls]
+Homepage = "https://github.com/chinaharry/bossify-with-claude"
+Repository = "https://github.com/chinaharry/bossify-with-claude"
 Documentation = "file://./SKILL.md"
 
 [tool.hatch.build.targets.wheel]
@@ -64,6 +66,9 @@ include = [
   "/tests",
   "/SKILL.md",
   "/README.md",
+  "/LICENSE",
+  "/NOTICE",
+  "/CITATION.cff",
   "/pyproject.toml",
 ]
 

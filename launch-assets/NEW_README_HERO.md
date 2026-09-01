@@ -8,7 +8,7 @@ Bossify reads your team's Claude Code sessions, asks a local LLM to judge every 
 
 ![demo](docs/assets/hero.gif)
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://python.org)
 [![Local-First](https://img.shields.io/badge/Local--First-100%25-brightgreen)](#)
 [![中文](https://img.shields.io/badge/i18n-EN%20%C2%B7%20%E4%B8%AD%E6%96%87-ff69b4)](README.zh.md)

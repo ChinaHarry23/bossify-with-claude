@@ -1,0 +1,44 @@
+# If you use Bossify in academic work or a derived product, please cite it.
+# GitHub uses this file for the "Cite this repository" button.
+# Replace given-names / family-names with the byline you will use on the paper
+# before you post a preprint. Until a paper DOI exists, cite the software.
+cff-version: 1.2.0
+title: Bossify
+message: If you use Bossify, please cite it using these metadata.
+type: software
+version: 0.1.0
+date-released: "2026-09-01"
+license: Apache-2.0
+repository-code: "https://github.com/chinaharry/bossify-with-claude"
+url: "https://github.com/chinaharry/bossify-with-claude"
+abstract: >-
+  Local-first flight recorder and ROI analyzer for agentic coding sessions.
+  Bossify attributes billed tokens to durable software outcomes from lossless
+  session event logs (Claude Code, Cursor, Aider, and similar tools).
+keywords:
+  - agentic software engineering
+  - token attribution
+  - ROI
+  - Claude Code
+  - developer productivity measurement
+authors:
+  - family-names: chinaharry
+    website: "https://github.com/chinaharry"
+    affiliation: "School of Computer Science, The University of Sydney"
+preferred-citation:
+  type: software
+  title: Bossify
+  version: 0.1.0
+  year: 2026
+  license: Apache-2.0
+  repository-code: "https://github.com/chinaharry/bossify-with-claude"
+  url: "https://github.com/chinaharry/bossify-with-claude"
+  authors:
+    - family-names: chinaharry
+      website: "https://github.com/chinaharry"
+      affiliation: "School of Computer Science, The University of Sydney"
+  notes: >-
+    Software citation. A research paper (working title: Token Capital
+    Allocation in Agentic Software Engineering: An Explainable Attribution
+    Model and Empirical Study) is in preparation. Cite that work instead
+    once it has a DOI or arXiv id.
